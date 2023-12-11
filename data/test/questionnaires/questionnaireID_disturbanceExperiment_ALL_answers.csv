@@ -1,0 +1,7 @@
+QuestionType,Question,QuestionID,Answer_Participant__condition_,Answer_Participant__condition_,Answer_Participant__condition_,Answer_Participant__condition_
+radio,I felt comfortable during the movements.,q1,5,6,5,3
+radio,I felt the robot was applying resistance during the movements.,q2,4,5,5,4
+radio,It seemed like I was in control of the exoskeleton.,q3,4,5,5,5
+radio,It seemed as if the exoskeleton was controlling me.,q4,6,5,6,4
+radio,It seemed like I was causing the movements of the exoskeleton.,q5,5,4,6,5
+
