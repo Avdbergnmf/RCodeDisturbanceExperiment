@@ -49,6 +49,9 @@ library(jsonlite) # for json files
 
 # Reshaping data for questionnaires
 library(reshape2)
+
+# For the rotation matrices
+library(geometry)
 ```
 
 (Optional) clear the environment
@@ -131,38 +134,16 @@ trackers # use one of the participants to get the different file names for all t
 
 # we make a list of the filenames so we can easily call them without writing the whole filename
 filenameDict <- list(
-  "camera" = "camera_movement_T",
-  "hip" = "hip_tracker_movement_T",
-  "leftnoise" = "left_noise_T",
   "leftfoot" = "leftfoot_tracker_movement_T",
-  "lefthand" = "lefthand_controller_movement_T",
-  "leftknee" = "leftknee_tracker_movement_T",
-  "rightknee" = "righknee_tracker_movement_T",
-  "rightnoise" = "right_noise_T",
+  "loko_lokodata" = "loko_lokodata_T",
   "rightfoot" = "rightfoot_tracker_movement_T",
-  "righthand" = "righthand_controller_movement_T",
-  "stepdetection" = "stepdetection_steps_T",
-  "steptargets" = "steptargets_targetsteps_T"
+  "tmleft" = "tmleft_tracker_movement_T",
+  "tmright" = "tmright_tracker_movement_T",
+  "vivetrackers" = "vivetrackers_SteamVRData_T"
 )
 
 # get any type of data
-getTdata <- function(pnum, trackerType, noiseTrial) {
-  if (noiseTrial){
-    if (startedWithNoise(pnum)){
-      trialNumber = 2
-    }
-    else{
-      trialNumber = 3
-    }
-  }
-  else {
-    if (startedWithNoise(pnum)){
-      trialNumber = 3
-    }
-    else{
-      trialNumber = 2
-    }
-  }
+getTdata <- function(pnum, trackerType, trialNumber) {
   
   # Construct filename from filenamePattern and participantNumber
   filename <- paste0(filenameDict[[trackerType]], sprintf("%03d", trialNumber), ".csv")
@@ -181,8 +162,6 @@ getTdata <- function(pnum, trackerType, noiseTrial) {
   return(data)
 }
 
-
-
 #getTdata(participants[1],"leftfoot",TRUE) # example usage
 ```
 
@@ -196,20 +175,28 @@ getQfile = function(pnum,qType){ # qType = IMI / SSQ / VEQ
   return(file.path(getPdir(pnum),"questionnaires",paste0("questionnaireID_",qType,"_ALL_answers.csv")))
 }
 
-getQdata <- function(pnum,qType) {
+getQdata <- function(pnum) {
   # Get the path to the questionnaire file for the participant
-  questionnaireFile <- getQfile(pnum,qType)
+  questionnaireFile <- getQfile(pnum, "disturbanceExperiment")
   
   # Read the CSV file into a data frame
   questionnaire <- read.csv(questionnaireFile)
   
-  # Extract the QuestionID and the two answer columns
-  result <- questionnaire[, c("QuestionID", "Answer_Participant__condition_Base", "Answer_Participant__condition_Noise")]
+  # Identifying the columns with answers
+  answerColumns <- grep("Answer_", names(questionnaire), value = TRUE)
+  
+  # Dynamically extract and label the data based on trial numbers
+  result <- data.frame(QuestionID = questionnaire$QuestionID)
+  for (i in seq_along(answerColumns)) {
+    columnName <- paste0("Trial_", i)
+    result[[columnName]] <- questionnaire[[answerColumns[i]]]
+  }
   
   return(result)
 }
 
-#getQdata(participants[4],"SSQ")# example usage
+
+#getQdata(participants[1])# example usage
 ```
 We extract this data and calculate some resulting scores each questionnaire. We then add the questionnaire data to our distances data table.
 
@@ -223,568 +210,296 @@ getQuestionInfo <- function(qType) { # qType = IMI / SSQ / VEQ
   return(questionnaire)
 }
 
-computeScores <- function(pnum, qType) {
-  qdata = getQdata(pnum,qType)
+computeScores <- function(pnum) {
+  qdata = getQdata(pnum)
   
-  qinfo = getQuestionInfo(qType)
+  qinfo = getQuestionInfo("disturbanceExperiment")
   combined <- merge(qdata, qinfo, by = "QuestionID")
+
+  # Find trial columns
+  trialColumns <- grep("Trial_", names(combined), value = TRUE)
+
+  # Initialize an empty list to store scores for each trial
+  allScores <- list()
+
+  # Loop through each trial column to calculate scores
+  for (trialCol in trialColumns) {
+    # Mirror the scores if needed
+    combined[[trialCol]] <- ifelse(combined$mirror, 8 - combined[[trialCol]], combined[[trialCol]])
+
+    # Compute the scores for each category for the trial
+    scoresTrial <- tapply(combined[[trialCol]], combined$category, mean, na.rm = TRUE)
+
+    # Compute the total score for the trial
+    scoresTrial["total"] <- mean(scoresTrial, na.rm = TRUE)
+    
+    # Store the calculated scores in the list
+    allScores[[trialCol]] <- scoresTrial
+  }
   
-  # Mirror the scores if needed
-  combined$Answer_Participant__condition_Base <- ifelse(combined$mirror, 8 - combined$Answer_Participant__condition_Base, combined$Answer_Participant__condition_Base)
-  combined$Answer_Participant__condition_Noise <- ifelse(combined$mirror, 8 - combined$Answer_Participant__condition_Noise, combined$Answer_Participant__condition_Noise)
-  
-  # Combine the data frames
-  
-  # Compute the scores for each category
-  scoresBase <- tapply(combined$Answer_Participant__condition_Base, combined$category, mean, na.rm = TRUE)
-  scoresNoise <- tapply(combined$Answer_Participant__condition_Noise, combined$category, mean, na.rm = TRUE)
-   
-  # Compute the total score for each condition
-  scoresBase["total"] <- mean(scoresBase, na.rm = TRUE)
-  scoresNoise["total"] <- mean(scoresNoise, na.rm = TRUE)
-  print(scoresBase)
-  return(list(base = scoresBase, noise = scoresNoise))
+  return(allScores)
 }
 
-#computeScores(participants[1], "IMI")# example usage
+#computeScores(participants[1])# example usage
 ```
 
 Now we can use this method to make a dataframe to get all scores for all the participants.
 
 ```{r}
-calculateAllScores <- function(participants, qType) {
-  # Initialize empty data frames to hold the results
-  dfBase <- data.frame()
-  dfNoise <- data.frame()
-  
+calculateAllScores <- function(participants) {
+  # Initialize an empty list to hold results for each trial
+  allScores <- list()
+
   # Iterate over the participants
   for (participant in participants) {
-    # Compute the scores
-    scores <- computeScores(participant, qType)
+    # Compute the scores for the participant
+    participantScores <- computeScores(participant)
     
-    # Transform the scores into a data frame with a single row and bind it with the participant ID
-    baseRow <- cbind(participant = participant, as.data.frame(t(scores$base)))
-    noiseRow <- cbind(participant = participant, as.data.frame(t(scores$noise)))
-    
-    # Add the scores to the data frames
-    dfBase <- rbind(dfBase, baseRow)
-    dfNoise <- rbind(dfNoise, noiseRow)
+    # Iterate over each trial's scores
+    for (trial in names(participantScores)) {
+      trialScores <- participantScores[[trial]]
+
+      # Transform the scores into a data frame with a single row and bind it with the participant ID
+      trialRow <- cbind(participant = participant, as.data.frame(t(trialScores)))
+
+      # If the trial doesn't exist in allScores, initialize it
+      if (!trial %in% names(allScores)) {
+        allScores[[trial]] <- data.frame()
+      }
+
+      # Add the scores to the corresponding trial in allScores
+      allScores[[trial]] <- rbind(allScores[[trial]], trialRow)
+    }
   }
   
-  allScores = list(base = dfBase, noise = dfNoise)
-  
-  # Reshape the data somewhat
-  allScores$base$VFD <- FALSE
-  allScores$noise$VFD <- TRUE
-  
-  combinedData <- rbind(allScores$noise, allScores$base)
+  # Reshape and combine all trials' data
+  combinedData <- do.call(rbind, lapply(names(allScores), function(trial) {
+    cbind(Trial = trial, allScores[[trial]])
+  }))
   
   return(combinedData)
 }
 
-#calculateAllScores(participants, "VEQ") # example use
+#calculateAllScores(participants) # example use
 ```
 
 
 ## Pre-processing
 
-### Find Foot Events
-
-We need to modify the data (as it is now), to find the actual timestamps when foot is lifted and placed back. We also register whether or not the step was done onto a target or not.
-
-```{r}
-otherFoot = function(foot){
-  if (foot == 'Left'){
-    return('Right')
-  }
-  else{
-    return('Left')
-  }
-}
-
-
-findFootEvents <- function(participant,VFD) {
-  # Some parameters to optimize our step detection
-  minStepDuration = 0.1 # s
-  
-  currFoot = "Left" # to keep track of which foot is currently stepping, we're tossing the first step anyway, so doesn't really matter.
-  lifted = FALSE
-  currStepNum = 1
-  
-  prevHeelStrikeTime = 0.0
-  minHeelstrikeTime = 0.0
-  
-  # Initialize empty data frames for heelStrikes and footLifts
-  heelStrikes <- data.frame()
-  footLifts <- data.frame()
-  
-  # Get the data
-  stepsData <- getTdata(participant,"stepdetection",VFD) 
-  targetData <- getTdata(participant,"steptargets",VFD)
-  
-  # Sometimes, the heelstrike is detected during toe-off, an easy fix is to make sure the event occurs above the average z coordinate. we first retrieve that here.
-  leftFoot <- getTdata(participant,"leftfoot",VFD)
-  rightFoot <- getTdata(participant,"rightfoot",VFD)
-  meanZ = mean(leftFoot$pos_z)
-  maxTime = min(max(leftFoot$time),max(rightFoot$time))
-  minTime = min(min(leftFoot$time),min(rightFoot$time))
-  
-  # Correct the starting time for all datasets
-  leftFoot$time = leftFoot$time - minTime
-  rightFoot$time = rightFoot$time - minTime
-  stepsData$time = stepsData$time - minTime
-  targetData$time = targetData$time - minTime
-  
-  # Iterate through the data
-  for (i in 3:nrow(stepsData)) {
-    # If foot != currFoot (or "" / some other way to fix the first step): return
-    
-    # Do some checks to see if the stepEvent is worth checking
-    if (stepsData$foot[i] != currFoot) { next }
-    if (stepsData$time[i] > maxTime | stepsData$time[i] < 0) { next }
-    if (stepsData$time[i] < minHeelstrikeTime) { next }
-    
-    # Get the z position of the current foot
-    if (currFoot=="Left"){
-      currZpos = leftFoot$pos_z[leftFoot$time==stepsData$time[i]]
-    }
-    else {
-      currZpos = rightFoot$pos_z[rightFoot$time==stepsData$time[i]]
-    }
-    if (length(currZpos)!=1) { currZpos = meanZ}
-    
-    # Detect event
-    if (!lifted) { # currFoot still on the ground?
-      if (currZpos>meanZ) {next}
-      
-      # If the current action is 'Swinging' and the previous action was 'HeelStrike' --> Toe-Off
-      if(stepsData$action[i] == 'Swinging' && stepsData$action[i-2] == 'Heelstrike'){ # i-2, because -1 is other foot
-        footLifts <- rbind(footLifts,  cbind(stepsData[i, c("time", "foot")],step=currStepNum) )
-        #minHeelstrikeTime = which(stepsData$time > stepsData$time[i]+minStepDuration)[1] # skip ahead by minStepDuration
-        lifted = TRUE
-      }
-    }
-    else { # currFoot is in the air
-      if (currZpos<meanZ) {next}
-      
-      # If the current action is 'Heelstrike' and the previous action was 'Swinging' --> Heel-strike
-      if(stepsData$action[i] == 'Heelstrike' && stepsData$action[i-2] == 'Swinging'){ # i-2, because -1 is other foot
-        # did we step onto a target in this step?
-        stepTime = stepsData[i, "time"]
-        targetsInTime = targetData[which(targetData$time<stepTime & targetData$time>prevHeelStrikeTime),]
-        prevHeelStrikeTime = stepTime
-        #print(currYfrac)
-        heelStrikes <- rbind(heelStrikes, cbind(stepsData[i, c("time", "foot")],step=currStepNum,target=length(targetsInTime$time)>0) )
-        
-        currFoot = otherFoot(stepsData$foot[i])
-        lifted = FALSE
-        currStepNum = currStepNum + 1
-      }
-    }
-      
-  }
-  
-  # Remove the first heel strike if it happens before the first foot lift
-  if (min(heelStrikes$time) < min(footLifts$time)) {
-    heelStrikes <- heelStrikes[!heelStrikes$time==min(heelStrikes$time), ]
-  }
-  
-  # Remove the last foot lift if it happens after the last heel strike
-  if (max(footLifts$time) > max(heelStrikes$time)) {
-    footLifts <- footLifts[!footLifts$time==max(footLifts$time), ]
-  }
-  
-  # Do some sanity checks
-  nrWrongOrder = length(which(heelStrikes$time < footLifts$time))
-  if (nrWrongOrder > 0){ # footlift should always come before heelstrike
-    print(paste(nrWrongOrder,"HEELSTRIKES BEFORE FOOTLIFTS!!!"))
-    wrongIndices = which(heelStrikes$time < footLifts$time)
-    print("heelStrikes")
-    print(head(heelStrikes[wrongIndices,]))
-    print("footLifts")
-    print(head(footLifts[wrongIndices,]))
-  }
-  if (length(which(heelStrikes$step != footLifts$step))>0){ # step numbers should match all the way across
-    print("UNMATCHED STEP NUMBER?!")
-    wrongIndices = which(heelStrikes$step != footLifts$step)
-    print("heelStrikes")
-    print(head(heelStrikes[wrongIndices,]))
-    print("footLifts")
-    print(head(footLifts[wrongIndices,]))
-  }
-
-  return(list(heelStrikes = heelStrikes, footLifts = footLifts))
-}
-
-
-footEvents <- findFootEvents(participants[4],TRUE) # example usage
-
-```
-
-### Gait Parameters
-
-#### Get Gait Data
-Now that we have split up the individual steps, we can extract some basic gait parameters.
-
-Calculate our step events:
-```{r, cache=TRUE}
-participant = participants[4]
-VFD = FALSE
-footEvents <- findFootEvents(participant,VFD) # this is costly, so I put it outside of the other code blocks so you don't have to run it every time.
-```
-
-Now we get our final gait data. Note that we remove the steps before and after the steps done onto a target (we don't want to use these for our gait analysis).
-```{r}
-check_lengths <- function(dataType,data1,data2){
-  print(paste("--- Checking Lengths",dataType,"--- "))
-  l1 = length(data1)
-  l2 = length(data2)
-  print(paste("Data 1:", l1,", Data 2:",l2))
-  
-  if (l1 != l2) { print("ERROR!: data lengths not matching")}
-}
-
-extend_foot_data = function(footData,noiseData) {
-  noiseData <- noiseData %>%  rowwise() %>% mutate(magnitude = sqrt(offset_x^2 + offset_y^2 + offset_z^2))
-  footData = cbind(footData,noiseData)
-  
-  footData$final_pos_x = footData$pos_x + footData$offset_x
-  footData$final_pos_y = footData$pos_y + footData$offset_y
-  footData$final_pos_z = footData$pos_z + footData$offset_z
-  
-  return(footData)
-}
-
-# Define the function to calculate relative position
-calc_relative_pos <- function(footEvents,footData,foot) {
-  # For easy reference
-  heelStrikes = footEvents$heelStrikes
-  footLifts = footEvents$footLifts
-  
-  # Subset the footData and heelStrikes for the given foot
-  footData <- footData[footData$foot == foot, ]
-  heelStrikes <- heelStrikes[heelStrikes$foot == foot, ]
-  
-  # Initialize new columns in footData_sub for relative position
-  footData$rel_pos_x <- footData$pos_x
-  footData$rel_pos_y <- footData$pos_y
-  footData$rel_pos_z <- footData$pos_z
-  # Loop through each heel strike
-  for (i in seq_len(nrow(heelStrikes))) {
-    # Determine the time of the current and next heel strike
-    current_time <- heelStrikes$time[i]
-    next_time <- ifelse(i < nrow(heelStrikes), heelStrikes$time[i+1], Inf)
-    
-    # Calculate the relative position for all footData_sub between current_time and next_time
-    target_time <- footLifts$time[i]
-    differences <- abs(footData$time - target_time)
-    startIndex <- which.min(differences)
-    #startIndex = which(footData$time == heelStrikes$time[i])
-    
-    if (length(startIndex)==0) {startIndex = 1}
-    idx <- which(footData$time > current_time & footData$time <= next_time)
-    footData$rel_pos_x[idx] <- footData$pos_x[idx] - footData$pos_x[startIndex]
-    footData$rel_pos_y[idx] <- footData$pos_y[idx] - footData$pos_y[startIndex]
-    footData$rel_pos_z[idx] <- footData$pos_z[idx] - footData$pos_z[startIndex]
-  }
-  
-  return(footData)
-}
-
-get_gait_data <- function(footEvents,participant,VFD){#rightData,leftData) { # start=first step to plot, end=last step to plot
-  # Get all data
-  rightNoise <- getTdata(participant,"rightnoise",VFD)
-  leftNoise <- getTdata(participant,"leftnoise",VFD)
-  
-  rightFoot = extend_foot_data(getTdata(participant,"rightfoot",VFD),rightNoise)
-  leftFoot = extend_foot_data(getTdata(participant,"leftfoot",VFD),leftNoise)
-  
-  # Correct the starting time for all datasets
-  minTime = min(min(leftFoot$time),min(rightFoot$time))
-  leftFoot$time = leftFoot$time - minTime
-  rightFoot$time = rightFoot$time - minTime
-  rightNoise$time = rightNoise$time - minTime
-  leftNoise$time = leftNoise$time - minTime
-  
-  # For easy reference
-  heelStrikes = footEvents$heelStrikes
-  footLifts = footEvents$footLifts
-  
-  # Get the subsets for each leg
-  rHeelStrikes = subset(heelStrikes, foot == "Right")
-  lHeelStrikes = subset(heelStrikes, foot == "Left")
-  rFootLifts = subset(footLifts, foot == "Right")
-  lFootLifts = subset(footLifts, foot == "Left")
-  # use them to get the foot positions during the foot events
-  rHeelStrikesData = subset(rightFoot, time %in% rHeelStrikes$time)
-  lHeelStrikesData = subset(leftFoot, time %in% lHeelStrikes$time)
-  rFootLiftsData = subset(rightFoot, time %in% rFootLifts$time)
-  lFootLiftsData = subset(leftFoot, time %in% lFootLifts$time)
-  
-  # Add some info 
-    # HeelStrikesData
-  rHeelStrikesData$step <- rHeelStrikes$step
-  lHeelStrikesData$step <- lHeelStrikes$step
-  rHeelStrikesData$foot <- "Right"
-  lHeelStrikesData$foot <- "Left"
-  
-    # FootLiftsData
-  rFootLiftsData$step <- rFootLifts$step
-  lFootLiftsData$step <- lFootLifts$step
-  rFootLiftsData$foot <- "Right"
-  lFootLiftsData$foot <- "Left"
-  # Combine the data
-    # HeelStrikes
-  heelStrikesData <- rbind(lHeelStrikesData, rHeelStrikesData) # Combine the dataframes
-  heelStrikesData = heelStrikesData[order(heelStrikesData$time), ]
-    # Footlifts
-  footLiftsData <- rbind(lFootLiftsData, rFootLiftsData) # Combine the dataframes
-  footLiftsData = footLiftsData[order(footLiftsData$time), ]
-  
-  # Add a column to the foot positions to indicate if a target step is used
-  heelStrikesData$target <- heelStrikesData$time %in% heelStrikes$time[heelStrikes$target]
-  
-  # Get the movement speed of this participant
-  walkSpeed = getPsetting(participant, "walk_speed")/3.6 # in m/s
-  
-  # add time*movespeed to pos_z to find the actual_pos_z
-  heelStrikesData$actual_pos_z = heelStrikesData$pos_z + heelStrikesData$time * walkSpeed
-  footLiftsData$actual_pos_z = footLiftsData$pos_z + footLiftsData$time * walkSpeed
-  heelStrikesData$actual_final_pos_z = heelStrikesData$final_pos_z + heelStrikesData$time * walkSpeed
-  footLiftsData$actual_final_pos_z = footLiftsData$final_pos_z + footLiftsData$time * walkSpeed
-  
-  # We also calculate the step height here, since we have all the data we need in this method
-  rightFoot$foot = "Right"
-  leftFoot$foot = "Left"
-  footData = rbind(rightFoot,leftFoot)
-  
-  stepHeights = calculate_step_heights(heelStrikesData,footData)
-  
-  # SOME SANITY CHECKS
-  matchingStepNr = head(heelStrikesData, -2)$step == tail(heelStrikesData, -2)$step - 2 # THIS COMPARISON SHOULD ALWAYS BE DONE WITH 1 STEP BEFORE 
-  if (sum(!matchingStepNr)>0) {
-    print("HOUSTON WE HAVE A PROBLEM: STEPNR NOT MATCHING")
-    print(head(heelStrikesData, -2))
-    print(tail(heelStrikesData, -2))
-  }
-  
-  matchingFoot = head(heelStrikesData, - 2)$foot == tail(heelStrikesData, -2)$foot # ONLY MATCHING FOOT SHOULD BE COMPARED
-  if (sum(!matchingFoot)>0) {
-    print("HOUSTON WE HAVE A PROBLEM: FOOT NOT MATCHING")
-    print(head(heelStrikesData, -2))
-    print(tail(heelStrikesData, -2))
-  }
-  
-  return(list(heelStrikesData = heelStrikesData,
-              footLiftsData = footLiftsData,
-              stepHeights = stepHeights))
-}
-
-calculate_step_heights <- function(heelStrikesData, footData) {
-  # Initialize a vector to store the step heights
-  stepHeights <- numeric(nrow(heelStrikesData) - 1)
-  
-  # Loop over the heel strikes
-  for (i in 1:(nrow(heelStrikesData) - 1)) {
-    # Get the time interval for the step
-    start_time <- heelStrikesData$time[i]
-    end_time <- heelStrikesData$time[i + 1]
-    
-    # Extract the foot data for the step
-    stepData <- subset(footData, time >= start_time & time < end_time & foot == heelStrikesData$foot[i])
-    
-    # Calculate the step height
-    stepHeights[i] <- max(stepData$pos_y)# - heelStrikesData$pos_y[i]
-  }
-  
-  return(stepHeights)
-}
-
-gaitData = get_gait_data(footEvents,participant,VFD)
-```
-
-#### Calculate Gait Parameters
+### Extract trial data
+We first find the start and end times for each trial and each participant
 
 ```{r}
-calculate_gait_parameters <- function(gaitData, filterTargetSteps=TRUE) {
-  heelStrikesData = gaitData$heelStrikesData
-  footLiftsData = gaitData$footLiftsData
-  stepHeights = gaitData$stepHeights
+findTrialTimes <- function(participant, trialNumber) {
+  # Retrieve trial start and end times from loko_lokodata
+  lokoData <- getTdata(participant, "loko_lokodata", trialNumber)
   
-  # time-based
-  stepTimes   <- diff(heelStrikesData$time)                       # Calculate step times  >>> NOTE: The first heelstrike is only used as a starting point to the second
-  swingTimes  <- heelStrikesData$time - footLiftsData$time        # Calculate swing times <<< L = N   (not N-1)
-  swingTimes  <- tail(swingTimes,   - 1)          # remove the FIRST swingTime (we have to sacrifice the first step to be able to do diff's)
-  stanceTimes <- stepTimes - swingTimes                           # Calculate stance times
-  #strideTimes <- head(stepTimes,    - 1) + tail(stepTimes, - 1)      # Calculate stride times >>> NOTE: The first step is removed, again!
-  
-  # position-based
-  stepWidths  <- diff(heelStrikesData$pos_x)                      # Calculate step width
-  stepWidths <- ifelse(head(heelStrikesData$foot,-1) == "Right", stepWidths * -1, stepWidths) # Adjust sign based on which foot is stepping
-  finalStepWidths <- diff(heelStrikesData$final_pos_x) 
-  finalStepWidths <- ifelse(head(heelStrikesData$foot,-1) == "Right", finalStepWidths * -1, finalStepWidths)
-  
-  stepLengths <- diff(heelStrikesData$actual_pos_z)               # Calculate step lengths
-  finalStepLengths <- diff(heelStrikesData$actual_final_pos_z)    # Calculate step lengths
-  
-  #strideLengths <- head(stepLengths, - 1) + tail(stepLengths, - 1)  # Calculate stride lengths  >>> NOTE: The first step is removed, again!
-  speed <- stepLengths / stepTimes                                # Calculate speed
-  
-  # Lets also add some info about the noise and foot positions
-  heelStrikesData = tail(heelStrikesData,-1) # remove the first heelstrike
-  
-  #heelStrike. = 
-  # Since we need to remove the first step to be able to calculate the stride parameters, we need to match the rest of the datasets accordingly --> Needed when looking at the stride stuff
-  #stepTimes   <- tail(stepTimes,    - 1)
-  #swingTimes  <- tail(swingTimes,   - 1)
-  #stanceTimes <- tail(stanceTimes,  - 1)
-  #stepWidths  <- tail(stepWidths,   - 1)
-  #stepLengths <- tail(stepLengths,  - 1)
-  #speed       <- tail(speed,        - 1)
-  
-  # We ignore the steps onto and away from a target
-  # and also add to the ignore list the outliers in the stepTimes and stepLengths (these are very obvious ways to remove the misdetected steps)
-  targetSteps = heelStrikesData$target
-  targetSteps = targetSteps | lead(heelStrikesData$target,default=FALSE) # add step before
-  targetSteps = targetSteps | lag(heelStrikesData$target,default=FALSE) | lag(heelStrikesData$target,2,default=FALSE) # add steps after (until foot is placed back onto new position)
-  heelStrikesData$targetIgnoreSteps = targetSteps
-  
-  # Calculate the step error
-  #stepError <- heelStrikesData$time * 0
-  #print(stepError)
-  
-  
-  print("totalsteps")
-  print(length(stepTimes))
-  print("targetSteps")
-  print(sum(targetSteps))
-  outlierSteps = detect_outliers(stepTimes) | detect_outliers(stepLengths)
-  print("outlierSteps")
-  print(sum(outlierSteps))
-  stepsToIgnore = outlierSteps
-  
-  if (filterTargetSteps) {
-    stepsToIgnore = outlierSteps | targetSteps
-  }
-  
-  # additionally, we ignore the first few steps as the treadmill is still speeding up
-  ignoreFirstN = 2
-  stepsToIgnore[1:ignoreFirstN] = TRUE
-  heelStrikesData$stepsToIgnore = stepsToIgnore # mark them in our dataset
-  
-  print("stepsToIgnore")
-  print(sum(stepsToIgnore))
-  
-  # Make a list of all the gait parameters
-  gaitParams =   list(
-    stepTimes = stepTimes,
-    stanceTimes = stanceTimes,
-    swingTimes = swingTimes,
-    finalStepWidths = finalStepWidths,
-    stepLengths = stepLengths,
-    finalStepLengths = finalStepLengths,
-    stepWidths = stepWidths,
-    stepHeights = stepHeights,
-    speed = speed,
-    heelStrikes = heelStrikesData # We also add the heelstrikes info as it's interesting for plotting.
+  # Identifying the index where trialStarted turns to 1
+  startIndex <- which(lokoData$trialStarted == 1)[1]
+  # Identifying the index where trialStarted turns back to 0
+  endIndex <- tail(which(lokoData$trialStarted == 1), 1) # this grabs the last time this happens, if there are multiple trials within the same datafile (which shouldn't happen), this is not accounted for
+
+  # Extracting time and Lokotime at the start and end of the trial
+  trialStartTime <- lokoData$time[startIndex]
+  trialStartLokotime <- lokoData$Lokotime[startIndex]
+  trialEndTime <- lokoData$time[endIndex]
+  trialEndLokotime <- lokoData$Lokotime[endIndex]
+
+  # Save the start and end times for later use or analysis
+  trialTimes <- data.frame(
+    Start_Time = trialStartTime, 
+    Start_Lokotime = trialStartLokotime,
+    End_Time = trialEndTime,
+    End_Lokotime = trialEndLokotime
   )
   
-  # Filter out the ignored steps
-  if (FALSE) {
-    gaitParams <- lapply(gaitParams, function(x) {
-    if (is.data.frame(x)) {
-        return(x[!stepsToIgnore, ])
-      } else {
-        return(subset(x,!stepsToIgnore))
-      }
-    })
-  }
-  
-  return(gaitParams)
+  return(trialTimes)
 }
 
-detect_outliers <- function(data) {
-  Q1 <- quantile(data, 0.25)
-  Q3 <- quantile(data, 0.75)
-  IQR <- Q3 - Q1
-
-  # Define the upper and lower bounds for outliers
-  upper_bound <- Q3 + 1.5 * IQR
-  lower_bound <- Q1 - 1.5 * IQR
-
-  return(!(data >= lower_bound & data <= upper_bound))
-}
-
-gaitParams = calculate_gait_parameters(gaitData) # example usage
+# Example usage
+#findTrialTimes(participants[1], 1)
 ```
 
+### Tracker data
 
-#### Put all results in df
-
-To make things easier to plot, we create 1 big data frame with all our gait parameters for all participants:
-
-> NOTE: This takes a LONG time to fully run, which is why we cache it.
-
-```{r cache=TRUE}
-# VFD conditions
-VFD_conditions <- c(TRUE, FALSE)
-
-# Initialize an empty data frame
-allGaitParams <- data.frame()
-
-print("Creating allGaitParameters...")
-# Loop over all participants
-for (participant in participants) {
-  print("-----")
-  print(paste("----- -----Participant: ",participant))
-  # Loop over VFD conditions
-  for (VFD in VFD_conditions) {
-    print(paste("----- ----- ----- -----VFD...",VFD))
-    # Get footEvents for participant
-    footEvents <- findFootEvents(participant,VFD)
-
-    # Calculate gait data and parameters
-    gaitData <- get_gait_data(footEvents, participant, VFD)
-    gaitParams <- calculate_gait_parameters(gaitData, TRUE)
-    
-    # Convert the list of gait parameters to a data frame
-    gaitParamsDf <- as.data.frame(gaitParams)
-    # Add a column for the participant identifier
-    gaitParamsDf$participant <- participant
-    gaitParamsDf$VFD <- VFD
-    
-    # Bind this participant's gait parameters to the overall data frame
-    allGaitParams <- rbind(allGaitParams, gaitParamsDf)
-  }
-}
-
-# Now allGaitParams is a data frame with the gait parameters for all participants and both VFD conditions
-```
-
-### Calculate means (& define categories)
-We also calculate the means for each of the gait parameters, and put them in a summary table, to easily reference later when plotting.
+All tracker data is recorded in the vivetracker csv. The others are just for backup but aren't used right now. We extract the relevant data by matching the timepoints in the lokodata.
 
 ```{r}
-categories = c("participant", "VFD")#,"heelStrikes.targetIgnoreSteps","heelStrikes.foot")
-dataTypes = colnames(allGaitParams)
-dataTypes <- setdiff(dataTypes, categories)
-
-get_summ <- function(dataType, categories){
-  # Filter out the good data
-  filtered = allGaitParams[allGaitParams$heelStrikes.stepsToIgnore==FALSE,]
+getTrackerDataForTrial <- function(participant, trialNumber) {
+  # Retrieve the trial times using findTrialTimes
+  trialTimes <- findTrialTimes(participant, trialNumber)
   
-  filtered %>%
-    group_by(across(all_of(categories))) %>%
-    summarise(
-        mean = mean(.data[[dataType]], na.rm = TRUE), 
-        sd = sd(.data[[dataType]], na.rm = TRUE), 
-        cv = sd(.data[[dataType]], na.rm = TRUE) / mean(.data[[dataType]], na.rm = TRUE),
-        .groups = 'drop'
-    )
+  # Get the tracker data
+  trackerData <- getTdata(participant, "vivetrackers", trialNumber)
+  
+  # Filter the tracker data based on trial start and end times
+  filteredTrackerData <- trackerData[
+    trackerData$systemTime >= trialTimes$Start_Time & trackerData$systemTime <= trialTimes$End_Time, 
+    ]
+  
+  return(filteredTrackerData)
 }
 
-mu <- lapply(dataTypes, get_summ, categories = categories)# c("participant", "VFD"))
-mu = setNames(mu, dataTypes)
+# Example usage
+#getTrackerDataForTrial(participants[1], 1)
+```
+
+### Find transformation matrices
+
+y = up
+z = 
+
+```{r}
+quaternionToRotationMatrix <- function(q) {
+    # Ensure the quaternion is normalized
+    q <- q / sqrt(sum(q^2))
+    
+    w <- q[1]
+    x <- q[2]
+    y <- q[3]
+    z <- q[4]
+
+    # Compute the elements of the rotation matrix
+    rotMatrix <- matrix(c(
+        1 - 2 * y^2 - 2 * z^2, 2 * x * y - 2 * z * w, 2 * x * z + 2 * y * w,
+        2 * x * y + 2 * z * w, 1 - 2 * x^2 - 2 * z^2, 2 * y * z - 2 * x * w,
+        2 * x * z - 2 * y * w, 2 * y * z + 2 * x * w, 1 - 2 * x^2 - 2 * y^2
+    ), nrow = 3, byrow = TRUE)
+
+    # Append a fourth row and column for homogeneous coordinates
+    rotMatrix <- rbind(rotMatrix, c(0, 0, 0))
+    rotMatrix <- cbind(rotMatrix, c(0, 0, 0, 1))
+
+    return(rotMatrix)
+}
+
+
+calculateTransformationMatrix <- function(trackerData) {
+  # Calculate the average position of the trackers over the first 100 frames
+  avgLeftPos <- colMeans(trackerData[1:100, c("TreadmillLeft.pos.x", "TreadmillLeft.pos.y", "TreadmillLeft.pos.z")])
+  avgRightPos <- colMeans(trackerData[1:100, c("TreadmillRight.pos.x", "TreadmillRight.pos.y", "TreadmillRight.pos.z")])
+
+  # New origin is the midpoint of the average positions
+  newOrigin <- (avgLeftPos + avgRightPos) / 2
+
+  # Calculate the average rotation (quaternion) of the trackers
+  avgLeftRot <- colMeans(trackerData[1:100, c("TreadmillLeft.rot.w", "TreadmillLeft.rot.x", "TreadmillLeft.rot.y", "TreadmillLeft.rot.z")])
+  avgRightRot <- colMeans(trackerData[1:100, c("TreadmillRight.rot.w", "TreadmillRight.rot.x", "TreadmillRight.rot.y", "TreadmillRight.rot.z")])
+  ### NOTE: order=WXYZ
+
+  # Combine and normalize the average rotations to define the new orientation
+  newOrientation <- (avgLeftRot + avgRightRot) / 2
+  newOrientation <- newOrientation / sqrt(sum(newOrientation^2))
+
+  # Convert the average quaternion to a rotation matrix
+  newRotMatrix <- quaternionToRotationMatrix(newOrientation)
+
+  # Create the translation matrix
+  translationMatrix <- diag(4)
+  translationMatrix[1:3, 4] <- -newOrigin
+
+  # Combine the rotation and translation into a single transformation matrix
+  transformationMatrix <- newRotMatrix %*% translationMatrix
+
+  return(transformationMatrix)
+}
+
+# Example usage with your tracker data
+#calculateTransformationMatrix(getTrackerDataForTrial(participants[1], 1))
+```
+
+### Return the transformed data
+
+```{r}
+transformTrackerData <- function(participant, foot, trialNumber, startTime = 0, endTime = 130) {
+    # Retrieve the tracker data for the specified trial and participant
+    trackerData <- getTrackerDataForTrial(participant, trialNumber)
+
+    # Calculate the transformation matrix
+    transformationMatrix <- calculateTransformationMatrix(trackerData)
+
+    # Select the appropriate columns based on the specified foot
+    if (foot == "left") {
+        footColumns <- c("LeftFoot.pos.x", "LeftFoot.pos.y", "LeftFoot.pos.z")
+    } else if (foot == "right") {
+        footColumns <- c("RightFoot.pos.x", "RightFoot.pos.y", "RightFoot.pos.z")
+    } else {
+        stop("Invalid foot specified. Choose either 'left' or 'right'.")
+    }
+
+    # Extract the foot position data and transform it
+    footData <- trackerData[, footColumns]
+    transformedData <- t(apply(footData, 1, function(pos) {
+        # Add a 1 for homogeneous coordinates
+        posHomogeneous <- c(pos, 1)
+        # Apply the transformation
+        transformedPos <- transformationMatrix %*% posHomogeneous
+        return(transformedPos[1:3])
+    }))
+
+    # Extract system time and adjust it relative to the first sample
+    systemTime <- trackerData$systemTime - trackerData$systemTime[1]
+
+    # Combine system time with transformed data
+    transformedDataFrame <- cbind(systemTime, as.data.frame(transformedData))
+    colnames(transformedDataFrame) <- c("time", "pos.x", "pos.y", "pos.z")
+
+    # Filter data based on the provided start and end times
+    filteredData <- transformedDataFrame[transformedDataFrame$time >= startTime & transformedDataFrame$time <= endTime,]
+
+    # Return the filtered data
+    return(filteredData)
+}
+
+# Example usage
+transformTrackerData(participants[1], "left", 1)
+```
+
+### Plot trajectories
+
+First thing to do is check if our transform works. Easiest way to verify is to plot the trajectories:
+
+```{r,echo=FALSE}
+xOptions = c("time", "pos.x", "pos.y", "pos.z")
+
+inputPanel(
+  selectizeInput("participant", "Participant", 
+                choices = participants, selected = participants[1], multiple = FALSE),
+  numericInput("TrialNumber", "Trial Number", 
+                min = 1, max = Inf, value = 1, step = 1),
+  selectizeInput("foot", "Foot", 
+                choices = c("left", "right"), selected = "left", multiple = FALSE),
+  selectizeInput("xplot", "X-axis", 
+                choices = xOptions, selected = xOptions[1], multiple = FALSE),
+  selectizeInput("yplot", "Y-axis", 
+                choices = xOptions, selected = xOptions[2], multiple = FALSE),
+  numericInput("plotheight", "Plot Height",
+            min = 50, max = Inf, value = 500, step = 50),
+  numericInput("start", "Start Time",
+              min = 0, max = 500, value = 0, step = 1),
+  numericInput("end", "End Time",
+              min = 0, max = 500, value = 120, step = 1)
+)
+
+makeLinePlot = reactive({
+  transformedData <- transformTrackerData(input$participant, input$foot, input$TrialNumber, input$start, input$end)
+
+  # Create plot
+  return(plotTransformedData(transformedData, input$xplot, input$yplot))
+})
+
+renderPlot({
+  makeLinePlot()
+}, height = reactive(input$plotheight))
+
+plotTransformedData <- function(transformedData, x_axis = "time", y_axis = "pos.x") {
+  p <- ggplot(data=transformedData, aes_string(x = x_axis, y = y_axis)) +
+    geom_path() +
+    labs(x = x_axis, y = y_axis)
+
+  return(p)
+}
+
 ```
 
 ## Plotting
@@ -794,530 +509,4 @@ Click here to save the figures
 inputPanel(
   actionButton("save", "Save figures")
 )
-```
-
-### Plot Steps function
-
-We have a bunch of time data that we want to plot the steps for. First, we select which data we want to plot:
-```{r}
-participant = participants[4]
-VFD = TRUE
-#footEvents <- findFootEvents(participant,VFD)
-```
-
-For the plotting we can use pretty much the same code, with some different inputs. To do this easily we define the following method:
-```{r}
-plot_steps <- function(footEvents,rightData,leftData, start, end, x_axis="time", y_axis="pos_z") { # start=first step to plot, end=last step to plot
-  heelStrikes = footEvents$heelStrikes
-  footLifts = footEvents$footLifts
-  
-  # Filter out a subset of the steps if needed
-  if (start > 1){start = start -1} # make sure we get the step before
-  steps = start:end
-  
-  if (length(steps) > 1){
-    heelStrikes = subset(heelStrikes,step %in% steps)
-    footLifts = subset(footLifts,step %in% steps)
-  }
-  
-  # Filter out the steps we want to plot
-  rHeelStrikes = subset(heelStrikes, foot == "Right")
-  lHeelStrikes = subset(heelStrikes, foot == "Left")
-  rFootLifts = subset(footLifts, foot == "Right")
-  lFootLifts = subset(footLifts, foot == "Left")
-  
-  timeMin = min(rHeelStrikes$time)
-  timeMax = max(rHeelStrikes$time)
-  rightData = subset(rightData, time > timeMin & time < timeMax)
-  leftData = subset(leftData, time > timeMin & time < timeMax)
-  
-  # Add a new column to both dataframes to identify the foot
-  rightData$foot <- "Right"
-  leftData$foot <- "Left"
-  # Combine the dataframes
-  both <- rbind(rightData, leftData)
-  # Let's also add the relative position to the dataset
-  leftData <- calc_relative_pos(footEvents,both,"Left")
-  rightData <- calc_relative_pos(footEvents,both,"Right")
-  both <- rbind(leftData, rightData)
-  both <- both[order(both$time), ] # Order by time
-  
-  lHeelStrikesData = subset(leftData, time %in% lHeelStrikes$time)
-  rHeelStrikesData = subset(rightData, time %in% rHeelStrikes$time)
-  lFootLiftsData = subset(leftData, time %in% lFootLifts$time)
-  rFootLiftsData = subset(rightData, time %in% rFootLifts$time)
-  
-  lHeelTargets = subset(lHeelStrikes, target == TRUE)
-  rHeelTargets = subset(rHeelStrikes, target == TRUE)
-  lHeelTargetsData = subset(leftData, time %in% lHeelTargets$time)
-  rHeelTargetsData = subset(rightData, time %in% rHeelTargets$time)
-  
-  # Find the target step timeframes
-  l_times <- get_times(lHeelStrikes, lHeelStrikesData, lHeelTargets)
-  r_times <- get_times(rHeelStrikes, rHeelStrikesData, rHeelTargets)
-  timeframes <- data.frame( start_times = c(l_times$start_times, r_times$start_times), # Concatenate start and end times
-                            end_times = c(l_times$end_times, r_times$end_times) )
-  
-  # Create the plot
-  targetSize = 5
-  footEventSize = 2
-  p = ggplot(both,                          aes(x = .data[[x_axis]], y = .data[[y_axis]], color = foot)) +
-    geom_path() +
-    #footlifts
-    geom_point(data = rFootLiftsData,   aes(x = .data[[x_axis]], y = .data[[y_axis]]),shape=24, color = "red",size = footEventSize) +
-    geom_point(data = lFootLiftsData,   aes(x = .data[[x_axis]], y = .data[[y_axis]]),shape=24, color = "blue", size = footEventSize) + # 12=empty square
-    #heelstrikes
-    geom_point(data = rHeelStrikesData, aes(x = .data[[x_axis]], y = .data[[y_axis]]),shape=25, color = "red", size = footEventSize) + # 16=ball
-    geom_point(data = lHeelStrikesData, aes(x = .data[[x_axis]], y = .data[[y_axis]]),shape=25, color = "blue", size = footEventSize) +
-    #targets
-    geom_point(data = rHeelTargetsData, aes(x = .data[[x_axis]], y = .data[[y_axis]]),shape=10, color = "red", size=targetSize) +
-    geom_point(data = lHeelTargetsData, aes(x = .data[[x_axis]], y = .data[[y_axis]]),shape=10, color = "blue", size=targetSize) + # 10=target
-    scale_color_manual(values = c("Right" = "black", "Left" = "grey"))
-    
-  
-    #labs(x = "Time", y = header_to_plot) +
-  if (x_axis == "time" | y_axis =="time") { 
-    p = p+geom_rect(data = timeframes, aes(xmin = start_times, xmax = end_times, ymin = -Inf, ymax = Inf), inherit.aes = FALSE, fill = "grey", alpha = 0.5)
-  }
-  else {
-    p = p+coord_equal()
-      #scale_x_continuous(limits = c(0, 100), breaks = seq(0, 100, by = 10)) +
-      #scale_y_continuous(limits = c(0, 100), breaks = seq(0, 100, by = 10))
-  }
-
-  return(p)
-}
-
-add_lines <- function(p, footEvents,rightData,leftData, start, end, x_axis="time", y_axis="pos_z") { # start=first step to plot, end=last step to plot
-  heelStrikes = footEvents$heelStrikes
-  
-  # Filter out a subset of the steps if needed
-  if (start > 1){start = start -1} # make sure we get the step before
-  steps = start:end
-  
-  if (length(steps) > 1){
-    heelStrikes = subset(heelStrikes,step %in% steps)
-    # Filter out the steps we want to plot
-    rHeelStrikes = subset(heelStrikes, foot == "Right")
-    timeMin = min(rHeelStrikes$time)
-    timeMax = max(rHeelStrikes$time)
-    rightData = subset(rightData, time > timeMin & time < timeMax)
-    leftData = subset(leftData, time > timeMin & time < timeMax)
-  }
-  
-  # Add a new column to both dataframes to identify the foot
-  rightData$foot <- "Right"
-  leftData$foot <- "Left"
-  
-  # Create the plot
-  p = p + geom_path(data = rightData, aes(x = .data[[x_axis]], y = .data[[y_axis]]), color = "pink") + 
-    geom_path(data = leftData, aes(x = .data[[x_axis]], y = .data[[y_axis]]), color = "lightblue")
-  return(p)
-}
-
-
-# Some helper methods
-
-replace_final_na <- function(vec, replace_value) {
-  if(is.na(tail(vec, n = 1))) {
-    vec[length(vec)] <- replace_value
-  }
-  return(vec)
-}
-
-get_times <- function(heelStrikes, heelStrikesData, heelTargets) {
-  remove_steps_before_target = 0
-  remove_steps_after_target = 1
-  
-  target_indices <- which(heelStrikes$time %in% heelTargets$time)
-  
-  # Check and correct out-of-bounds indices for start_times
-  start_indices <- target_indices - 2 - remove_steps_before_target
-  start_indices[start_indices < 1] <- 1
-  start_indices[start_indices > nrow(heelStrikesData)] <- nrow(heelStrikesData)
-  # Check and correct out-of-bounds indices for end_times
-  end_indices <- target_indices - 1 + remove_steps_after_target
-  end_indices[end_indices < 1] <- 1
-  end_indices[end_indices > nrow(heelStrikesData)] <- nrow(heelStrikesData)
-  
-  # Get the time vectors
-  start_times <- heelStrikesData[start_indices,]$time
-  end_times   <- heelStrikesData[end_indices,]$time
-  #end_times   <- replace_final_na(end_times, heelStrikesData[target_indices[length(target_indices)],]$time)
-  
-  return(list(start_times = start_times, end_times = end_times))
-}
-```
-This will create a plot with the inputted data, also marking down the step events (footlift, heelstrike, and target steps).
-
-### Plot Steps and VFD
-
-We can now use this method to plot some of the stepping data:
-```{r,echo=FALSE}
-xOptions = c("time","pos_x","pos_y","pos_z")
-
-xOptionsVFD = c("time","magnitude","offset_x","offset_y","offset_z","final_pos_x","final_pos_y","final_pos_z","rel_pos_x","rel_pos_y","rel_pos_z")
-xOptions = c(xOptions,xOptionsVFD)
-
-inputPanel(
-  selectizeInput("participant", "participant", 
-                choices = participants, selected = participants[1],multiple = FALSE),
-  selectizeInput("VFD", "VFD", 
-                choices = c(TRUE,FALSE), selected = TRUE,multiple = FALSE),
-  selectizeInput("xplot", "xplot", 
-                choices = xOptions, selected = xOptions[2],multiple = FALSE),
-  selectizeInput("yplot", "yplot", 
-                choices = xOptions, selected = xOptions[3],multiple = FALSE),
-  numericInput("start", "start",
-              min = 0, max = 500, value = 0, step = 1),
-  numericInput("end", "end",
-              min = 0, max = 500, value = 0, step = 1),
-  numericInput("plotheight", "plotheight",
-            min = 50, max = Inf, value = 500, step = 50)
-)
-
-reactiveFootEvents = reactive({
-  return(findFootEvents(input$participant,input$VFD))
-})
-
-makeLinePlot = reactive({
-  footEvents <- reactiveFootEvents()
-  
-  rightFoot <- getTdata(input$participant,"rightfoot",input$VFD)
-  leftFoot <- getTdata(input$participant,"leftfoot",input$VFD)
-  
-  rightNoise <- getTdata(input$participant,"rightnoise",input$VFD)
-  leftNoise <- getTdata(input$participant,"leftnoise",input$VFD)
-  
-  rightFoot = extend_foot_data(rightFoot,rightNoise)
-  leftFoot = extend_foot_data(leftFoot,leftNoise)
-  
-  # Correct time
-  startTime = min(min(rightFoot$time),min(leftFoot$time))
-  rightFoot$time = rightFoot$time - startTime
-  leftFoot$time = leftFoot$time - startTime
-  
-  # create plot
-  return(plot_steps(footEvents,rightFoot,leftFoot,input$start,input$end,input$xplot,input$yplot))
-})
-
-renderPlot({
-  makeLinePlot()
-},height=reactive(input$plotheight))
-
-observeEvent(input$save, {
-  p = makeLinePlot()
-  ggsave("linePlot.svg", plot = p, device = "svg")#,height=reactive(input$plotheight))#, height = 3, width = 3, unit = 'in')   
-})
-
-```
-
-### Plot gait parameters
-
-Let's plot the distribution of the gait parameters for the different groups. Use the input fields to split the histograms in different ways.
-
-```{r, echo=FALSE}
-categoriesInputs = append(categories,"None")
-
-inputPanel(
-  selectizeInput("plot", "Plot", 
-                choices = dataTypes, selected = dataTypes[1],multiple = FALSE),
-  selectizeInput("group", "Group by", 
-                choices = categoriesInputs, selected = categoriesInputs[1],multiple = FALSE),
-  selectizeInput("position", "Bar positions", 
-                choices = c("stack","identity","dodge"), selected = "identity",multiple = FALSE),
-  selectizeInput("split", "Split by", 
-                choices = categoriesInputs, selected = "None",multiple = FALSE),
-  checkboxInput("means", "Show means", 
-                value=TRUE),
-  numericInput("height", "Height per plot",
-              min = 50, max = 500, value = 200, step = 50),
-  numericInput("bin", "Bin width",
-              min = 0.001, max = 0.5, value = 0.01, step = 0.01),
-)
-inputPanel(
-  selectizeInput("filterParticipants", "Participants", choices = participants,selected=participants, multiple = TRUE),
-  selectizeInput("filterVFD", "VFD", choices = c(TRUE,FALSE), selected=c(TRUE,FALSE),multiple = TRUE),
-  selectizeInput("filterTargets", "Target Steps", choices = c(TRUE,FALSE),selected=FALSE, multiple = TRUE)
-)
-
-plotCount <- reactive({
-  colName = as.character(input$split)
-  return ( uniqueN(allGaitParams[[colName]]) )
-})
-
-plotHeight <- reactive( 
-  if (input$split=="None") {
-    return (input$height)
-  }
-  else { return (input$height*plotCount()) } 
-)
-
-filteredParams = reactive({
-  included = allGaitParams[["participant"]] %in% input$filterParticipants
-  included = included & allGaitParams[["VFD"]] %in% input$filterVFD
-  included = included & allGaitParams[["heelStrikes.targetIgnoreSteps"]] %in% input$filterTargets
-  
-  return(allGaitParams[included,])
-})
-
-makeHistogramPlot = reactive({
-  aes = aes_string(x=input$plot)
-  a = 1
-  fill="grey"
-  if (input$group!="None") { 
-    fill="white"
-    aes = modifyList(aes,aes_string(col=input$group)) 
-    if (input$position == "identity") {a = 1/2}
-  }
-  
-  p = ggplot(filteredParams(), aes) + 
-    geom_histogram(binwidth=input$bin,fill=fill,alpha=a, position=input$position)
-  
-  if (input$means && input$split != "None") {p = p + geom_vline(mu[[input$plot]],mapping=aes_string(xintercept="grp.mean",col=input$split),linetype="dashed") }
-  if (input$means && input$split == "None" && input$group != "None") {
-    p = p + geom_vline(mu[[input$plot]],mapping=aes_string(xintercept="grp.mean",col=input$group),linetype="dashed") 
-  }
-  
-  if (input$split != "None") {p = p+facet_grid(sym(input$split))}
-  
-  return(p)
-})
-
-renderPlot({
-  makeHistogramPlot()
-  },height=reactive(plotHeight())
-)
-
-#observeEvent(input$save, {
-#  p = makeHistogramPlot()
-#  ggsave("histo.svg", plot = p, device = "svg",height=reactive(plotHeight()))#, height = 3, width = 3, unit = 'in')   
-#})
-
-```
-
-### Scatterplots
-
-We can now use this method to plot some of the stepping data:
-```{r,echo=FALSE}
-inputPanel(
-  selectizeInput("xscatter", "xscatter", 
-                choices = dataTypes, selected = dataTypes[1],multiple = FALSE),
-  selectizeInput("yscatter", "yscatter", 
-                choices = dataTypes, selected = dataTypes[1],multiple = FALSE)
-)
-
-makeScatterPlot = reactive({
-  aes = aes_string(x=input$xscatter, y=input$yscatter, col=input$group)
-  
-  p = ggplot(filteredParams(), aes) + 
-    geom_point(alpha=0.5) # Set the alpha to make overlapping points more visible
-  
-  return(p)
-})
-
-renderPlot({
-  makeScatterPlot()
-})
-
-#observeEvent(input$save, {
-#  p = makeScatterPlot()
-#  ggsave("scatter.svg", plot = p, device = "svg")#, height = 3, width = 3, unit = 'in')   
-#})
-
-```
-
-### Removed Steps
-
-```{r}
-# Load the data
-df <- read.csv("./data/StepsRemovalData.csv")
-
-# Filter out any missing participants
-df = subset(df, participant %in% participants)
-
-# Melt the data
-df_melted <- df %>%
-  pivot_longer(cols = c(targetsteps, outliers, included),
-               names_to = "Step Type", 
-               values_to = "Count")
-# Specify your desired order
-desired_order <- c("targetsteps",  "outliers", "included")
-
-# Pie charts for each unique VFD value:
-for (VFD_value in unique(df$VFD)) {
-  df_filtered <- df_melted %>%
-    filter(VFD == VFD_value) %>%
-    group_by(`Step Type`) %>%
-    summarise(TotalCount = sum(Count), .groups = "drop") 
-
-  # Convert `Step Type` to a factor and specify the order of the levels
-  df_filtered$`Step Type` <- factor(df_filtered$`Step Type`, levels = desired_order)
-
-  df_filtered$label_pos <- cumsum(df_filtered$TotalCount) - 0.5*df_filtered$TotalCount
-
-  total_steps <- sum(df_filtered$TotalCount)
-  
-  p <- ggplot(df_filtered, aes(x = "", y = TotalCount, fill = `Step Type`)) +
-    geom_bar(stat = "identity", width = 1) +
-    coord_polar("y", start = 0) +
-    theme_void() +
-    scale_fill_brewer(palette = "Pastel1") +
-    geom_text(aes(label = TotalCount, y = label_pos), color = "black") +
-    ggtitle(paste("VFD =", VFD_value, "| Total steps =", total_steps))
-  
-  print(p)
-}
-
-# Pie charts for each unique participant value:
-for (participant_value in unique(df$participant)) {
-  df_filtered <- df_melted %>%
-    filter(participant == participant_value) %>%
-    group_by(`Step Type`) %>%
-    summarise(TotalCount = sum(Count), .groups = "drop") 
-
-  # Convert `Step Type` to a factor and specify the order of the levels
-  df_filtered$`Step Type` <- factor(df_filtered$`Step Type`, levels = desired_order)
-
-  df_filtered$label_pos <- cumsum(df_filtered$TotalCount) - 0.5*df_filtered$TotalCount
-  
-  total_steps <- sum(df_filtered$TotalCount)
-  
-  p <- ggplot(df_filtered, aes(x = "", y = TotalCount, fill = `Step Type`)) +
-    geom_bar(stat = "identity", width = 1) +
-    coord_polar("y", start = 0) +
-    theme_void() +
-    scale_fill_brewer(palette = "Pastel1") +
-    geom_text(aes(label = TotalCount, y = label_pos), color = "black") +
-    ggtitle(paste("Participant =", participant_value, "| Total steps =", total_steps))
-  
-  print(p)
-}
-
-# Pie chart for all participant and VFD values:
-df_filtered <- df_melted %>%
-  group_by(`Step Type`) %>%
-  summarise(TotalCount = sum(Count), .groups = "drop")
-
-# Convert `Step Type` to a factor and specify the order of the levels
-df_filtered$`Step Type` <- factor(df_filtered$`Step Type`, levels = desired_order)
-
-df_filtered$label_pos <- cumsum(df_filtered$TotalCount) - 0.5*df_filtered$TotalCount
-
-total_steps <- sum(df_filtered$TotalCount)
-
-p <- ggplot(df_filtered, aes(x = "", y = TotalCount, fill = `Step Type`)) +
-  geom_bar(stat = "identity", width = 1) +
-  coord_polar("y", start = 0) +
-  theme_void() +
-  scale_fill_brewer(palette = "Pastel1") +
-  geom_text(aes(label = TotalCount, y = label_pos), color = "black") +
-  ggtitle(paste("All Participants & VFD | Total steps =", total_steps))
-
-print(p)
-
-
-```
-
-### Plotting Questionnaires
-
-#### Plotting function
-```{r}
-plotQuestionnaireData <- function(qType, participants, cols_to_include) {
-  # Get the data
-  data <- calculateAllScores(participants, qType)
-  
-  # Only keep the columns to include in the plot
-  if (length(cols_to_include)==0) { 
-    cols_to_include = setdiff(colnames(data),c("participant", "VFD"))
-  }
-  data <- data[, c("participant", "VFD", cols_to_include), drop = FALSE] 
-  
-  # Reshape the data to long format for ggplot
-  data_long <- reshape2::melt(data, id.vars = c("participant", "VFD"))
-  
-  # Create the plot for each column to include
-  p <- ggpaired(data = data_long, 
-                x = "VFD", 
-                y = "value", 
-                id = "participant",
-                color = "VFD", 
-                line.color = "gray", 
-                line.size = 0.4) +
-    facet_wrap(~ variable, scales = "free",ncol = length(cols_to_include)) +
-    labs(x = "VFD", y = "Score") +
-    ggtitle(paste0("Boxplots of ", qType, " Scores")) +
-    theme(plot.title = element_text(hjust = 0.5)) + 
-    ylim(0, 7)  # Set y-axis limits
-  
-  return(p)
-}
-
-
-# Example use:
-Q = "IMI"
-p = plotQuestionnaireData(Q, participants, c()) # "none", "total"
-ggsave(paste0(Q,"_QuestionnaireData.svg"), plot = p, device = "svg")
-p
-```
-
-
-
-#### Plots
-```{r}
-questionnaireList = c("VEQ","SSQ","IMI")
-
-inputPanel(
-  selectizeInput("plotQ", "Plot Questionnaire", choices = questionnaireList,selected=questionnaireList[1], multiple = FALSE)
-)
-
-renderPlot({
-  plotQuestionnaireData(input$plotQ,participants,c())
-})
-```
-
-### Boxplot on Step variability
-
-#### Plotting function
-
-```{r}
-plotVariabilityData <- function(datatype,metric) {
-  # Get the data
-  cols_to_include = c(metric)
-  data = mu[[datatype]]
-  data <- data[, c("participant", "VFD", metric), drop = FALSE] 
-  # Reshape the data to long format for ggplot
-  data_long <- reshape2::melt(data, id.vars = c("participant", "VFD"))
-  
-  # Create the plot for each column to include
-  p <- ggpaired(data = data_long, 
-                x = "VFD", 
-                y = "value", 
-                id = "participant",
-                color = "VFD", 
-                line.color = "gray", 
-                line.size = 0.4) +
-    #facet_wrap(~ variable, scales = "free", ncol = length(cols_to_include)) +
-    labs(x = "VFD", y = metric) +
-    ggtitle(paste0("Boxplots of ", datatype," (",metric , ") Scores")) +
-    theme(plot.title = element_text(hjust = 0.5)) + 
-    coord_cartesian(ylim = range(data_long$value, na.rm = TRUE)) # Set y limits to the range of y values in data
-  
-  return(p)
-}
-
-
-# Example use:
-datatype = "stepWidths"
-metric = "cv"  # mean, sd, cv
-p = plotVariabilityData(datatype,metric)
-ggsave(paste0(datatype,"_",metric,"_VariabilityData.svg"), plot = p, device = "svg")
-#ggsave("VariabilityData", plot = p, device = "svg")
-p
-```
-
-
-```{r}
-
-
 ```

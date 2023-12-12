@@ -1,0 +1,6 @@
+QuestionID,Question,mirror,category
+q1,I felt comfortable during the movements.,false,comfort
+q2,I felt the robot was applying resistance during the movements.,false,transparency
+q3,It seemed like I was in control of the exoskeleton.,false,agency
+q4,It seemed as if the exoskeleton was controlling me.,false,agency
+q5,It seemed like I was causing the movements of the exoskeleton.,false,agency
