@@ -52,6 +52,9 @@ library(reshape2)
 
 # For the rotation matrices
 library(geometry)
+
+# For the filtering of the artefacts
+library(zoo)
 ```
 
 (Optional) clear the environment
@@ -61,6 +64,7 @@ cat("\014")  # clear console
 ```
 
 ## Loading in the Data
+Loading done with help of chatgpt-4.0, see chat [here](https://chat.openai.com/share/e776898f-356f-4b5b-8d75-656ed7fd7a6f).
 
 ### Obtaining the paths & participant details
 
@@ -120,7 +124,7 @@ getPdetail <- function(pnum, detailName) {
   return(detailValue)
 }
 
-#getPdetail(participants[1],"age") # example usage
+getPdetail(participants[1],"age") # example usage
 ```
 
 ### Get the tracking data
@@ -296,6 +300,7 @@ findTrialTimes <- function(participant, trialNumber) {
   
   # Identifying the index where trialStarted turns to 1
   startIndex <- which(lokoData$trialStarted == 1)[1]
+  
   # Identifying the index where trialStarted turns back to 0
   endIndex <- tail(which(lokoData$trialStarted == 1), 1) # this grabs the last time this happens, if there are multiple trials within the same datafile (which shouldn't happen), this is not accounted for
 
@@ -373,39 +378,76 @@ quaternionToRotationMatrix <- function(q) {
     return(rotMatrix)
 }
 
+averageQuaternion <- function(quaternions) {
+  # Ensure all quaternions are normalized
+  normalizedQuaternions <- t(apply(quaternions, 1, function(q) {
+    q / sqrt(sum(q^2))
+  }))
+
+  # Calculate the weighted average
+  avgQ <- colMeans(normalizedQuaternions)
+
+  # Normalize the result
+  avgQ <- avgQ / sqrt(sum(avgQ^2))
+
+  return(avgQ)
+}
+
+quaternionToUpVector <- function(quaternion) {
+  # Convert quaternion to rotation matrix
+  rotMatrix <- quaternionToRotationMatrix(quaternion)
+  # Extract 'up' vector (second row of the rotation matrix)
+  upVector <- rotMatrix[2, 1:3]
+  return(upVector)
+}
+
+vectorCrossProduct <- function(a, b) {
+  c(
+    a[2]*b[3] - a[3]*b[2],
+    a[3]*b[1] - a[1]*b[3],
+    a[1]*b[2] - a[2]*b[1]
+  )
+}
+
 
 calculateTransformationMatrix <- function(trackerData) {
   # Calculate the average position of the trackers over the first 100 frames
   avgLeftPos <- colMeans(trackerData[1:100, c("TreadmillLeft.pos.x", "TreadmillLeft.pos.y", "TreadmillLeft.pos.z")])
   avgRightPos <- colMeans(trackerData[1:100, c("TreadmillRight.pos.x", "TreadmillRight.pos.y", "TreadmillRight.pos.z")])
 
-  # New origin is the midpoint of the average positions
-  newOrigin <- (avgLeftPos + avgRightPos) / 2
+  # X Axis: Line between two trackers
+  xAxis <- avgRightPos - avgLeftPos
+  xAxis <- xAxis / sqrt(sum(xAxis^2))  # Normalize
 
-  # Calculate the average rotation (quaternion) of the trackers
-  avgLeftRot <- colMeans(trackerData[1:100, c("TreadmillLeft.rot.w", "TreadmillLeft.rot.x", "TreadmillLeft.rot.y", "TreadmillLeft.rot.z")])
-  avgRightRot <- colMeans(trackerData[1:100, c("TreadmillRight.rot.w", "TreadmillRight.rot.x", "TreadmillRight.rot.y", "TreadmillRight.rot.z")])
-  ### NOTE: order=WXYZ
+  # Y Axis: Average 'up' direction of the trackers
+  # Assuming 'up' is represented by the y-component of the quaternion rotation
+  leftUp <- quaternionToUpVector(colMeans(trackerData[1:100, c("TreadmillLeft.rot.w", "TreadmillLeft.rot.x", "TreadmillLeft.rot.y", "TreadmillLeft.rot.z")]))
+  rightUp <- quaternionToUpVector(colMeans(trackerData[1:100, c("TreadmillRight.rot.w", "TreadmillRight.rot.x", "TreadmillRight.rot.y", "TreadmillRight.rot.z")]))
+  yAxis <- (leftUp + rightUp) / 2
+  yAxis <- yAxis / sqrt(sum(yAxis^2))  # Normalize
 
-  # Combine and normalize the average rotations to define the new orientation
-  newOrientation <- (avgLeftRot + avgRightRot) / 2
-  newOrientation <- newOrientation / sqrt(sum(newOrientation^2))
+  # Z Axis: Orthogonal to X and Y
+  zAxis <- vectorCrossProduct(xAxis, yAxis)
+  zAxis <- zAxis / sqrt(sum(zAxis^2))  # Normalize
 
-  # Convert the average quaternion to a rotation matrix
-  newRotMatrix <- quaternionToRotationMatrix(newOrientation)
-
+  # Create the rotation matrix
+  rotationMatrix <- rbind(xAxis, yAxis, zAxis)
+  #rotationMatrix <- rbind(c(1,0,0), c(0,1,0), c(0,0,1))
+  rotationMatrix = quaternionToRotationMatrix(c(1,0,0,0))
+  # Ensure rotation matrix is 3x3
+  rotationMatrix <- matrix(rotationMatrix, nrow = 3, ncol = 3)
   # Create the translation matrix
   translationMatrix <- diag(4)
-  translationMatrix[1:3, 4] <- -newOrigin
+  translationMatrix[1:3, 4] <- -colMeans(rbind(avgLeftPos, avgRightPos))
 
   # Combine the rotation and translation into a single transformation matrix
-  transformationMatrix <- newRotMatrix %*% translationMatrix
+  transformationMatrix <- rbind(cbind(rotationMatrix, translationMatrix[1:3,4]), c(0, 0, 0, 1))
 
   return(transformationMatrix)
 }
 
 # Example usage with your tracker data
-#calculateTransformationMatrix(getTrackerDataForTrial(participants[1], 1))
+calculateTransformationMatrix(getTrackerDataForTrial(participants[1], 1))
 ```
 
 ### Return the transformed data
@@ -452,12 +494,58 @@ transformTrackerData <- function(participant, foot, trialNumber, startTime = 0, 
 }
 
 # Example usage
-transformTrackerData(participants[1], "left", 1)
+#transformTrackerData(participants[1], "left", 1)
+```
+
+
+### Filtering artefacts
+We also need to filter out artefacts from our dataset (points at which the trackers disconnected). We identify these by using a threshold velocity
+
+```{r}
+filterArtifacts <- function(data, velocity_threshold = 10, passes = 1) {
+  data$artifact <- FALSE  # Initialize the artifact column
+  for(i in 1:passes) {
+    # Calculate Velocity
+    data <- data %>%
+      mutate(
+        diff_x = c(NA, diff(pos.x)),
+        diff_y = c(NA, diff(pos.y)),
+        diff_z = c(NA, diff(pos.z)),
+        diff_time = c(NA, diff(time))
+      ) %>%
+      mutate(
+        distance = sqrt(diff_x^2 + diff_y^2 + diff_z^2),
+        velocity = distance / diff_time
+      )
+
+    # Identify artifacts based on velocity threshold
+    artifact_indices <- which(data$velocity > velocity_threshold)
+    data$artifact[artifact_indices] <- TRUE  # Mark artifacts
+
+    # Filter out artifacts for interpolation
+    tempData <- data
+    tempData[artifact_indices, c("pos.x", "pos.y", "pos.z")] <- NA
+
+    # Interpolate missing data
+    tempData$pos.x <- na.approx(tempData$pos.x)
+    tempData$pos.y <- na.approx(tempData$pos.y)
+    tempData$pos.z <- na.approx(tempData$pos.z)
+
+    # Replace position data with interpolated data
+    data[, c("pos.x", "pos.y", "pos.z")] <- tempData[, c("pos.x", "pos.y", "pos.z")]
+  }
+
+  return(data)
+}
+
+
+# Usage example:
+#filterArtifacts(transformTrackerData(participants[1], "left", 1),10)
 ```
 
 ### Plot trajectories
 
-First thing to do is check if our transform works. Easiest way to verify is to plot the trajectories:
+First thing to do is check if our transform works. We also want to double check the points we filter out to make sure we are not discarding important data. Easiest way to verify is to plot the trajectories:
 
 ```{r,echo=FALSE}
 xOptions = c("time", "pos.x", "pos.y", "pos.z")
@@ -478,14 +566,16 @@ inputPanel(
   numericInput("start", "Start Time",
               min = 0, max = 500, value = 0, step = 1),
   numericInput("end", "End Time",
-              min = 0, max = 500, value = 120, step = 1)
+              min = 0, max = 500, value = 120, step = 1),
+  numericInput("maxv", "Max velocity (m/s)",
+              min = 0, max = 500, value = 10, step = 1)
 )
 
 makeLinePlot = reactive({
-  transformedData <- transformTrackerData(input$participant, input$foot, input$TrialNumber, input$start, input$end)
-
+  data <- transformTrackerData(input$participant, input$foot, input$TrialNumber, input$start, input$end)
+  #data = filterArtifacts(data, input$maxv)
   # Create plot
-  return(plotTransformedData(transformedData, input$xplot, input$yplot))
+  return(plotTransformedData(data, input$xplot, input$yplot))
 })
 
 renderPlot({
@@ -493,14 +583,19 @@ renderPlot({
 }, height = reactive(input$plotheight))
 
 plotTransformedData <- function(transformedData, x_axis = "time", y_axis = "pos.x") {
-  p <- ggplot(data=transformedData, aes_string(x = x_axis, y = y_axis)) +
-    geom_path() +
-    labs(x = x_axis, y = y_axis)
+  p <- ggplot() +
+    geom_line(data = transformedData, aes_string(x = x_axis, y = y_axis), color = "black") +
+    geom_point(data = transformedData[transformedData$artifact, ], aes_string(x = x_axis, y = y_axis), color = "red") +
+    labs(x = x_axis, y = y_axis) +
+    theme_minimal()
 
   return(p)
 }
 
+
 ```
+
+
 
 ## Plotting
 
