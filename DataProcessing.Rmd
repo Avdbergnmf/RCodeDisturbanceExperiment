@@ -464,7 +464,7 @@ filterArtifacts <- function(data, trackerName, velocity_threshold = 10, rotation
   tempData[artifact_indices, trackerCols] <- NA
   # we want to filter the missing data before checking the big jumps
   tempData[, posCols] <- na.approx(tempData[, posCols]) # approx position
-  tempData <- interpolateQuaternions(tempData, quatCols, artifact_indices) # approx rotation
+  #tempData <- interpolateQuaternions(tempData, quatCols, artifact_indices) # approx rotation
   
   for (i in 1:passes) {
     # Calculate Velocity
@@ -497,12 +497,12 @@ filterArtifacts <- function(data, trackerName, velocity_threshold = 10, rotation
     combined_artifact_indices <- unique(c(velocity_artifact_indices, rotational_velocity_artifact_indices))
     
     # Mark artifacts
-    data$artifact[combined_artifact_indices] <- trackerName
+    data$artifact[velocity_artifact_indices] <- trackerName
 
     # Interpolate
-    tempData[combined_artifact_indices, trackerCols] <- NA
+    tempData[velocity_artifact_indices, trackerCols] <- NA
     tempData[, posCols] <- na.approx(tempData[, posCols])
-    tempData <- interpolateQuaternions(tempData, quatCols, combined_artifact_indices)
+    #tempData <- interpolateQuaternions(tempData, quatCols, combined_artifact_indices)
   }
   
   data[, trackerCols] <- tempData[, trackerCols]
@@ -753,7 +753,7 @@ renderRglwidget({
   
   # Create your 3D plot
   # Assuming transformedData is available globally
-  lines3d(data[[cols3d[1]]], data[[cols3d[1]]], data[[cols3d[1]]], color="black")
+  lines3d(data[[cols3d[1]]], data[[cols3d[2]]], data[[cols3d[3]]], color="black")
   #specialPoints <- transformedData[transformedData$artifact, ]
   #points3d(specialPoints$x, specialPoints$y, specialPoints$z, color="red", size=3)
   
