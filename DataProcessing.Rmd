@@ -55,6 +55,9 @@ library(geometry)
 
 # For the filtering of the artefacts
 library(zoo)
+
+# Interactive 3D plots
+library(rgl)
 ```
 
 (Optional) clear the environment
@@ -63,10 +66,10 @@ rm(list=ls())  # clear objects
 cat("\014")  # clear console
 ```
 
-## Loading in the Data
+# Loading in the Data
 Loading done with help of chatgpt-4.0, see chat [here](https://chat.openai.com/share/e776898f-356f-4b5b-8d75-656ed7fd7a6f).
 
-### Obtaining the paths & participant details
+## Obtaining the paths & participant details
 
 First, we get list of all participants, which are saved into folders in data directory.
 
@@ -124,10 +127,10 @@ getPdetail <- function(pnum, detailName) {
   return(detailValue)
 }
 
-getPdetail(participants[1],"age") # example usage
+#getPdetail(participants[1],"age") # example usage
 ```
 
-### Get the tracking data
+## Get the tracking data
 
 We'll need the paths to the [trackers](https://github.com/immersivecognition/unity-experiment-framework/wiki/Data-collection). Which contain all the data which is tracked for each of the trials. The same tracker names are used for each participant for each session (condition in this case), so we'll just get a list we can refer back to later. Additionally, we'll define another function to get a certain tracker dataset for a selected participant.
 
@@ -170,7 +173,7 @@ getTdata <- function(pnum, trackerType, trialNumber) {
 ```
 
 
-### Get the Questionnaire data
+## Get the Questionnaire data
 The questionnaire data is in a separate file. First, we write some methods to extract the data.
 ```{r}
 questionnaireInfoFolder = file.path(".","questionnaires")
@@ -288,9 +291,9 @@ calculateAllScores <- function(participants) {
 ```
 
 
-## Pre-processing
+# Pre-processing
 
-### Extract trial data
+## Extract trial data
 We first find the start and end times for each trial and each participant
 
 ```{r}
@@ -325,34 +328,275 @@ findTrialTimes <- function(participant, trialNumber) {
 #findTrialTimes(participants[1], 1)
 ```
 
-### Tracker data
+## Tracker data
 
 All tracker data is recorded in the vivetracker csv. The others are just for backup but aren't used right now. We extract the relevant data by matching the timepoints in the lokodata.
 
 ```{r}
-getTrackerDataForTrial <- function(participant, trialNumber) {
+getTrackerDataForTrial <- function(participant, trialNumber, startTime = 0, endTime = 130) {
   # Retrieve the trial times using findTrialTimes
   trialTimes <- findTrialTimes(participant, trialNumber)
   
   # Get the tracker data
-  trackerData <- getTdata(participant, "vivetrackers", trialNumber)
+  data <- getTdata(participant, "vivetrackers", trialNumber)
   
   # Filter the tracker data based on trial start and end times
-  filteredTrackerData <- trackerData[
-    trackerData$systemTime >= trialTimes$Start_Time & trackerData$systemTime <= trialTimes$End_Time, 
-    ]
+  data <- data[
+    data$time >= trialTimes$Start_Time & data$time <= trialTimes$End_Time, 
+  ]
   
-  return(filteredTrackerData)
+  # Replace recording time ("time") with real, more accurate, time of the recording thread ("systemTime")
+  data$time = data$systemTime
+  data$systemTime<- NULL
+  
+  # Adjust time so its relative to the first sample
+  data$time <- data$time - data$time[1]
+  
+  # We use this for filtering artifacts later
+  data$artifact <- "none" # fill it first
+  
+  return(data)
 }
 
 # Example usage
-#getTrackerDataForTrial(participants[1], 1)
+trackerData <- getTrackerDataForTrial(participants[1], 1)
+#trackerData
 ```
 
-### Find transformation matrices
+# Post-processing
+We need to filter and transform our data before we can extract the gait parameters.
 
-y = up
-z = 
+## Filtering artefacts
+First, we filter out artefacts from our dataset (points at which the trackers disconnected). We identify these by using two methods:
+- One of the components is equal to zero (this almost only happens when a tracker disconnects).
+- A threshold velocity is passed. Points at which the trackers shoot away from one frame to the next.
+
+```{r}
+# For interpolation quaternions
+slerp <- function(q1, q2, t) {
+    cosTheta <- sum(q1 * q2)
+    if (cosTheta < 0) {
+        q1 <- -q1
+        cosTheta <- -cosTheta
+    }
+
+    if (cosTheta > 0.95) {
+        # If the quaternions are very close, linearly interpolate and normalize the result
+        result <- (1 - t) * q1 + t * q2
+        return(result / sqrt(sum(result * result)))
+    }
+
+    theta <- acos(cosTheta)
+    sinTheta <- sqrt(1 - cosTheta * cosTheta)
+
+    return((sin((1 - t) * theta) * q1 + sin(t * theta) * q2) / sinTheta)
+}
+
+interpolateQuaternions <- function(data, quatCols, artifact_indices) {
+  if (length(artifact_indices) == 0) {
+      return(data) # No artifacts to interpolate
+  }
+  
+  n <- nrow(data)
+  artifact_indices <- c(1949, artifact_indices)
+  artifact_indices <- sort(unique(artifact_indices)) # Ensure indices are sorted and unique
+  artifact_diffs <- c(1, diff(artifact_indices), 1) # Differences, with padding for first and last indices
+
+  # Identify starts and ends of artifact sequences
+  starts <- artifact_indices[artifact_diffs[-length(artifact_diffs)] > 1]
+  ends <- artifact_indices[artifact_diffs[-1] > 1]
+
+  # Include the first artifact index in starts and the last in ends if not already included
+  if (artifact_indices[1] != starts[1]) {
+      starts <- c(artifact_indices[1], starts)
+  }
+  if (tail(artifact_indices, 1) != tail(ends, 1)) {
+      ends <- c(ends, tail(artifact_indices, 1))
+  }
+
+  for (i in seq_along(starts)) {
+      startIdx <- starts[i]
+      endIdx <- ends[i]
+      # Find nearest non-artifact indices
+      prevIdx <- if (startIdx > 1) max(1, startIdx - 1) else NA
+      nextIdx <- if (endIdx < n) min(n, endIdx + 1) else NA
+      
+      # Interpolate if valid indices are found
+      if (!is.na(prevIdx) && !is.na(nextIdx)) {
+          q1 <- data[prevIdx, quatCols]
+          q2 <- data[nextIdx, quatCols]
+          for (j in startIdx:endIdx) {
+              t <- (j - prevIdx) / (nextIdx - prevIdx)
+              data[j, quatCols] <- slerp(q1, q2, t)
+          }
+      }
+  }
+
+  return(data)
+}
+
+# Function to calculate quaternion difference
+quatDiff <- function(q1, q2) {
+    # Assuming quaternions are normalized
+    dot_product <- sum(q1 * q2)
+    return(2 * acos(abs(dot_product))) # Absolute value ensures the shortest path
+}
+
+filterArtifacts <- function(data, trackerName, velocity_threshold = 10, rotational_velocity_threshold = 3, passes = 1) { # velocity_threshold in m/s , rotational_velocity_threshold in rad/s
+  pattern <- paste0("^", trackerName) # get just the position data
+  trackerCols <- grep(pattern, colnames(data), value = TRUE) # Get the column names that match the pattern
+  posCols <- grep(".pos", trackerCols, value = TRUE) # only the position columns (these are used to get the velocity)
+  quatCols <- grep(".rot", trackerCols, value = TRUE) # Quaternion columns
+
+  if (length(posCols) != 3) {
+    stop("Error: found more than 3 position columns.")
+  }
+  
+  tempData <- data
+  artifact_indices <- c()
+  
+  # Check if any component is exactly zero, mark as artifact
+  for (col in trackerCols) {
+    artifact_indices <- c(artifact_indices, which(tempData[[col]] == 0))
+  }
+  
+  data$artifact[artifact_indices] <- trackerName # mark the datapoints
+  tempData[artifact_indices, trackerCols] <- NA
+  # we want to filter the missing data before checking the big jumps
+  tempData[, posCols] <- na.approx(tempData[, posCols]) # approx position
+  tempData <- interpolateQuaternions(tempData, quatCols, artifact_indices) # approx rotation
+  
+  for (i in 1:passes) {
+    # Calculate Velocity
+    tempData <- tempData %>%
+      mutate(
+          diff_x = c(NA, diff(get(posCols[1]))),
+          diff_y = c(NA, diff(get(posCols[2]))),
+          diff_z = c(NA, diff(get(posCols[3]))),
+          diff_time = c(NA, diff(time)),
+      )%>%
+      mutate(
+          distance = sqrt(diff_x^2 + diff_y^2 + diff_z^2),
+          velocity = distance / diff_time
+      )
+    
+    # Calculate quaternion rotational velocity
+    rotational_velocity <- rep(NA, nrow(tempData))
+    for (j in 2:nrow(tempData)) {
+        q1 <- tempData[j - 1, quatCols]
+        q2 <- tempData[j, quatCols]
+        angle_diff <- quatDiff(q1, q2)
+        rotational_velocity[j] <- angle_diff / tempData$diff_time[j]
+    }
+
+    tempData$rotational_velocity <- rotational_velocity
+    
+    # Identify velocity artifacts
+    velocity_artifact_indices <- which(tempData$velocity > velocity_threshold)
+    rotational_velocity_artifact_indices <- which(tempData$rotational_velocity > rotational_velocity_threshold)
+    combined_artifact_indices <- unique(c(velocity_artifact_indices, rotational_velocity_artifact_indices))
+    
+    # Mark artifacts
+    data$artifact[combined_artifact_indices] <- trackerName
+
+    # Interpolate
+    tempData[combined_artifact_indices, trackerCols] <- NA
+    tempData[, posCols] <- na.approx(tempData[, posCols])
+    tempData <- interpolateQuaternions(tempData, quatCols, combined_artifact_indices)
+  }
+  
+  data[, trackerCols] <- tempData[, trackerCols]
+  
+  return(data)
+}
+
+#filterArtifacts(trackerData, "LeftFoot") # example usage
+
+filterAllData <- function(data, velocity_threshold = 10, rotational_velocity_threshold = 500, passes = 1) {
+  # Process and filter each dataset with a unique artifact label  --> Note, if 2 datasets both have an artefact at the same time frame, only the last one here will be saved.
+  data <- filterArtifacts(data, "TreadmillRight", velocity_threshold, rotational_velocity_threshold, passes)
+  data <- filterArtifacts(data, "TreadmillLeft", rotational_velocity_threshold, velocity_threshold, passes)
+  data <- filterArtifacts(data, "LeftFoot", velocity_threshold, rotational_velocity_threshold, passes)
+  #data <- filterArtifacts(data, "RightFoot", velocity_threshold, passes)
+  
+  return(data)
+}
+
+# Usage example:
+filteredData <- filterAllData(trackerData, 10, 50, 1)
+filteredData[filteredData$artifact != "none",]
+```
+
+### Select data to plot
+Select what data to plot for the trajectory plots.
+
+```{r, echo=FALSE}
+inputPanel(
+  selectizeInput("participant", "Participant", 
+                choices = participants, selected = participants[1], multiple = FALSE),
+  numericInput("TrialNumber", "Trial Number", 
+                min = 1, max = Inf, value = 1, step = 1),
+  numericInput("start", "Start Time",
+              min = 0, max = 500, value = 0, step = 1),
+  numericInput("end", "End Time",
+              min = 0, max = 500, value = 120, step = 1)
+)
+```
+
+### 2D Plot
+We plot our data in 2D to check our filtered datapoints to make sure we are not discarding important data. Play with the max velocity by which the data is filtered.
+
+```{r,echo=FALSE}
+posCols <- grep(".pos", colnames(trackerData), value = TRUE)
+rotCols <- grep(".rot", colnames(trackerData), value = TRUE)
+xOptions = c("time", posCols, rotCols)
+
+inputPanel(
+  selectizeInput("xplot", "X-axis", 
+                choices = xOptions, selected = xOptions[1], multiple = FALSE),
+  selectizeInput("yplot", "Y-axis", 
+                choices = xOptions, selected = xOptions[2], multiple = FALSE),
+  numericInput("maxv", "Max velocity (m/s)",
+              min = 0, max = 500, value = 10, step = 1),
+  numericInput("maxvRot", "Max rotational velocity (rad/s)",
+              min = 0, max = 5000, value = 300, step = 15),
+  numericInput("plotheight", "Plot Height",
+            min = 50, max = Inf, value = 500, step = 50),
+)
+
+renderPlot({
+  data <- getTrackerDataForTrial(input$participant, input$TrialNumber)
+  data <- filterAllData(data, input$maxv, input$maxvRot, 1)
+  
+  # Create plot
+  return(plotData2D(data, input$xplot, input$yplot))
+}, height = reactive(input$plotheight))
+
+plotData2D <- function(data, x_axis, y_axis) {
+  # Filter out the desired time to plot
+  data <- data[trackerData$time >= input$start & trackerData$time <= input$end, ]
+  
+  p <- ggplot(data, aes_string(x = x_axis, y = y_axis)) +
+    geom_line(color = "black") +
+    geom_point(aes_string(color = "artifact"), data = data[data$artifact != "none", ]) +
+    scale_color_manual(values = c("LeftFoot" = "red", "RightFoot" = "blue", "TreadmillLeft" = "green", "TreadmillRight" = "purple")) +
+    theme_minimal()
+    #labs(x = x_axis, y = y_axis) +
+
+  return(p)
+}
+```
+
+## Transform data
+We also need to transform the data to the Lokomat reference frame.
+
+### Find transformation matrix
+First, we find the transformation matrix by using the two trackers next to the treadmill to identify the origin position and orientation.
+
+Here:
+- `x = right`
+- `y = up`
+- `z = front`
 
 ```{r}
 quaternionToRotationMatrix <- function(q) {
@@ -432,8 +676,8 @@ calculateTransformationMatrix <- function(trackerData) {
 
   # Create the rotation matrix
   rotationMatrix <- rbind(xAxis, yAxis, zAxis)
-  #rotationMatrix <- rbind(c(1,0,0), c(0,1,0), c(0,0,1))
-  rotationMatrix = quaternionToRotationMatrix(c(1,0,0,0))
+  rotationMatrix <- rbind(c(1,0,0), c(0,1,0), c(0,0,1))
+  
   # Ensure rotation matrix is 3x3
   rotationMatrix <- matrix(rotationMatrix, nrow = 3, ncol = 3)
   # Create the translation matrix
@@ -447,157 +691,81 @@ calculateTransformationMatrix <- function(trackerData) {
 }
 
 # Example usage with your tracker data
-calculateTransformationMatrix(getTrackerDataForTrial(participants[1], 1))
+tmatrix <- calculateTransformationMatrix(filteredData)
+#tmatrix
 ```
 
-### Return the transformed data
+### Transformed the data
 
 ```{r}
-transformTrackerData <- function(participant, foot, trialNumber, startTime = 0, endTime = 130) {
-    # Retrieve the tracker data for the specified trial and participant
-    trackerData <- getTrackerDataForTrial(participant, trialNumber)
-
-    # Calculate the transformation matrix
-    transformationMatrix <- calculateTransformationMatrix(trackerData)
-
-    # Select the appropriate columns based on the specified foot
-    if (foot == "left") {
-        footColumns <- c("LeftFoot.pos.x", "LeftFoot.pos.y", "LeftFoot.pos.z")
-    } else if (foot == "right") {
-        footColumns <- c("RightFoot.pos.x", "RightFoot.pos.y", "RightFoot.pos.z")
-    } else {
-        stop("Invalid foot specified. Choose either 'left' or 'right'.")
-    }
-
-    # Extract the foot position data and transform it
-    footData <- trackerData[, footColumns]
-    transformedData <- t(apply(footData, 1, function(pos) {
-        # Add a 1 for homogeneous coordinates
-        posHomogeneous <- c(pos, 1)
-        # Apply the transformation
-        transformedPos <- transformationMatrix %*% posHomogeneous
-        return(transformedPos[1:3])
-    }))
-
-    # Extract system time and adjust it relative to the first sample
-    systemTime <- trackerData$systemTime - trackerData$systemTime[1]
-
-    # Combine system time with transformed data
-    transformedDataFrame <- cbind(systemTime, as.data.frame(transformedData))
-    colnames(transformedDataFrame) <- c("time", "pos.x", "pos.y", "pos.z")
-
-    # Filter data based on the provided start and end times
-    filteredData <- transformedDataFrame[transformedDataFrame$time >= startTime & transformedDataFrame$time <= endTime,]
-
-    # Return the filtered data
-    return(filteredData)
-}
-
-# Example usage
-#transformTrackerData(participants[1], "left", 1)
-```
-
-
-### Filtering artefacts
-We also need to filter out artefacts from our dataset (points at which the trackers disconnected). We identify these by using a threshold velocity
-
-```{r}
-filterArtifacts <- function(data, velocity_threshold = 10, passes = 1) {
-  data$artifact <- FALSE  # Initialize the artifact column
-  for(i in 1:passes) {
-    # Calculate Velocity
-    data <- data %>%
-      mutate(
-        diff_x = c(NA, diff(pos.x)),
-        diff_y = c(NA, diff(pos.y)),
-        diff_z = c(NA, diff(pos.z)),
-        diff_time = c(NA, diff(time))
-      ) %>%
-      mutate(
-        distance = sqrt(diff_x^2 + diff_y^2 + diff_z^2),
-        velocity = distance / diff_time
-      )
-
-    # Identify artifacts based on velocity threshold
-    artifact_indices <- which(data$velocity > velocity_threshold)
-    data$artifact[artifact_indices] <- TRUE  # Mark artifacts
-
-    # Filter out artifacts for interpolation
-    tempData <- data
-    tempData[artifact_indices, c("pos.x", "pos.y", "pos.z")] <- NA
-
-    # Interpolate missing data
-    tempData$pos.x <- na.approx(tempData$pos.x)
-    tempData$pos.y <- na.approx(tempData$pos.y)
-    tempData$pos.z <- na.approx(tempData$pos.z)
-
-    # Replace position data with interpolated data
-    data[, c("pos.x", "pos.y", "pos.z")] <- tempData[, c("pos.x", "pos.y", "pos.z")]
-  }
-
+transformTrackerData <- function(data, trackerName, tmatrix) {
+  pattern <- paste0("^", trackerName) # get just the position data
+  trackerCols <- grep(pattern, colnames(data), value = TRUE) # Get the column names that match the pattern
+  posCols <- grep(".pos", trackerCols, value = TRUE) # only the position columns (these are used to get the velocity)
+  quatCols <- grep(".rot", trackerCols, value = TRUE) # Quaternion columns
+  
+  # Transform function
+  transformedData <- t(apply(data[, posCols], 1, function(pos) {
+          posHomogeneous <- c(pos, 1)  # Add a 1 for homogeneous coordinates
+          transformedPos <- tmatrix %*% posHomogeneous  # Apply the transformation
+          return(transformedPos[1:3])
+          }))
+  
+  data[, posCols] <- transformedData
+  
   return(data)
 }
 
+# Example usage
+#transformTrackerData(trackerData, "LeftFoot", tmatrix)
 
-# Usage example:
-#filterArtifacts(transformTrackerData(participants[1], "left", 1),10)
-```
-
-### Plot trajectories
-
-First thing to do is check if our transform works. We also want to double check the points we filter out to make sure we are not discarding important data. Easiest way to verify is to plot the trajectories:
-
-```{r,echo=FALSE}
-xOptions = c("time", "pos.x", "pos.y", "pos.z")
-
-inputPanel(
-  selectizeInput("participant", "Participant", 
-                choices = participants, selected = participants[1], multiple = FALSE),
-  numericInput("TrialNumber", "Trial Number", 
-                min = 1, max = Inf, value = 1, step = 1),
-  selectizeInput("foot", "Foot", 
-                choices = c("left", "right"), selected = "left", multiple = FALSE),
-  selectizeInput("xplot", "X-axis", 
-                choices = xOptions, selected = xOptions[1], multiple = FALSE),
-  selectizeInput("yplot", "Y-axis", 
-                choices = xOptions, selected = xOptions[2], multiple = FALSE),
-  numericInput("plotheight", "Plot Height",
-            min = 50, max = Inf, value = 500, step = 50),
-  numericInput("start", "Start Time",
-              min = 0, max = 500, value = 0, step = 1),
-  numericInput("end", "End Time",
-              min = 0, max = 500, value = 120, step = 1),
-  numericInput("maxv", "Max velocity (m/s)",
-              min = 0, max = 500, value = 10, step = 1)
-)
-
-makeLinePlot = reactive({
-  data <- transformTrackerData(input$participant, input$foot, input$TrialNumber, input$start, input$end)
-  #data = filterArtifacts(data, input$maxv)
-  # Create plot
-  return(plotTransformedData(data, input$xplot, input$yplot))
-})
-
-renderPlot({
-  makeLinePlot()
-}, height = reactive(input$plotheight))
-
-plotTransformedData <- function(transformedData, x_axis = "time", y_axis = "pos.x") {
-  p <- ggplot() +
-    geom_line(data = transformedData, aes_string(x = x_axis, y = y_axis), color = "black") +
-    geom_point(data = transformedData[transformedData$artifact, ], aes_string(x = x_axis, y = y_axis), color = "red") +
-    labs(x = x_axis, y = y_axis) +
-    theme_minimal()
-
-  return(p)
+transformAllData <- function(data, tmatrix) {
+  data <- transformTrackerData(data, "LeftFoot", tmatrix)
+  data <- transformTrackerData(data, "RightFoot", tmatrix)
+  data <- transformTrackerData(data, "TreadmillLeft", tmatrix)
+  data <- transformTrackerData(data, "TreadmillRight", tmatrix)
+  return(data)
 }
 
+# Usage example:
+transformedData <- transformAllData(filteredData, tmatrix)
+```
+
+
+### 3D Plot
+
+First thing to do is check if our transform works. We do this by making a 3D plot that shows our new reference frame. 
+
+```{r,echo=FALSE}
+inputPanel(
+  numericInput("3dplotheight", "Plot Height",
+            min = 50, max = Inf, value = 500, step = 50)
+)
+cols3d <- grep("LeftFoot.pos", colnames(trackerData), value = TRUE)
+
+renderRglwidget({
+  # Clear existing rgl plot
+  rgl::rgl.clear()
+  data <- getTrackerDataForTrial(input$participant, input$TrialNumber)
+  data <- filterAllData(data, input$maxv, 1)
+  tmatrix <- calculateTransformationMatrix(data)
+  data <- transformAllData(data, tmatrix)
+  
+  # Create your 3D plot
+  # Assuming transformedData is available globally
+  lines3d(data[[cols3d[1]]], data[[cols3d[1]]], data[[cols3d[1]]], color="black")
+  #specialPoints <- transformedData[transformedData$artifact, ]
+  #points3d(specialPoints$x, specialPoints$y, specialPoints$z, color="red", size=3)
+  
+  # Return the rgl widget
+  rglwidget()
+})
 
 ```
 
 
 
-## Plotting
+# Plotting
 
 Click here to save the figures
 ```{r, echo=FALSE}
@@ -605,3 +773,10 @@ inputPanel(
   actionButton("save", "Save figures")
 )
 ```
+
+
+
+
+## Plot trajectories
+
+
