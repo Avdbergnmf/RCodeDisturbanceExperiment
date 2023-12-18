@@ -355,6 +355,9 @@ getTrackerDataForTrial <- function(participant, trialNumber, startTime = 0, endT
   # We use this for filtering artifacts later
   data$artifact <- "none" # fill it first
   
+  # For some reason there sometimes are duplicate rows, we filter those out here
+  data <- data %>% distinct()
+  
   return(data)
 }
 
@@ -397,15 +400,25 @@ interpolateQuaternions <- function(data, quatCols, artifact_indices) {
       return(data) # No artifacts to interpolate
   }
   
+  
+  
+  ### Interpolating this data takes too much compute, but we don't need rotations anyway so lets ignore this problem for now.
+  data[, quatCols] <- na.approx(data[, quatCols])
+  return(data)
+  ### For now, we do linear interpolation, which is way faster but not actually accurate
+  
   n <- nrow(data)
-  artifact_indices <- c(1949, artifact_indices)
   artifact_indices <- sort(unique(artifact_indices)) # Ensure indices are sorted and unique
   artifact_diffs <- c(1, diff(artifact_indices), 1) # Differences, with padding for first and last indices
 
   # Identify starts and ends of artifact sequences
   starts <- artifact_indices[artifact_diffs[-length(artifact_diffs)] > 1]
   ends <- artifact_indices[artifact_diffs[-1] > 1]
-
+  if (length(starts) == 0 || length(ends) ==0){
+    starts <- artifact_indices[1]
+    ends <- artifact_indices[length(artifact_indices)]
+  }
+  
   # Include the first artifact index in starts and the last in ends if not already included
   if (artifact_indices[1] != starts[1]) {
       starts <- c(artifact_indices[1], starts)
@@ -435,74 +448,67 @@ interpolateQuaternions <- function(data, quatCols, artifact_indices) {
   return(data)
 }
 
-# Function to calculate quaternion difference
-quatDiff <- function(q1, q2) {
-    # Assuming quaternions are normalized
-    dot_product <- sum(q1 * q2)
-    return(2 * acos(abs(dot_product))) # Absolute value ensures the shortest path
-}
-
 filterArtifacts <- function(data, trackerName, velocity_threshold = 10, rotational_velocity_threshold = 3, passes = 1) { # velocity_threshold in m/s , rotational_velocity_threshold in rad/s
   pattern <- paste0("^", trackerName) # get just the position data
   trackerCols <- grep(pattern, colnames(data), value = TRUE) # Get the column names that match the pattern
   posCols <- grep(".pos", trackerCols, value = TRUE) # only the position columns (these are used to get the velocity)
   quatCols <- grep(".rot", trackerCols, value = TRUE) # Quaternion columns
 
-  if (length(posCols) != 3) {
-    stop("Error: found more than 3 position columns.")
+  if (length(posCols) != 3 || length(quatCols) != 4) {
+      stop("Error: Incorrect number of position or quaternion columns.")
   }
   
   tempData <- data
   artifact_indices <- c()
   
   # Check if any component is exactly zero, mark as artifact
+  THRESHOLD = 0.00001
   for (col in trackerCols) {
-    artifact_indices <- c(artifact_indices, which(tempData[[col]] == 0))
+    artifact_indices <- c(artifact_indices, which(abs(tempData[[col]]) == 0))
   }
+  artifact_indices <- sort(unique(artifact_indices))
   
   data$artifact[artifact_indices] <- trackerName # mark the datapoints
+  
   tempData[artifact_indices, trackerCols] <- NA
   # we want to filter the missing data before checking the big jumps
   tempData[, posCols] <- na.approx(tempData[, posCols]) # approx position
-  #tempData <- interpolateQuaternions(tempData, quatCols, artifact_indices) # approx rotation
+  tempData <- interpolateQuaternions(tempData, quatCols, artifact_indices) # approx rotation
   
   for (i in 1:passes) {
-    # Calculate Velocity
-    tempData <- tempData %>%
-      mutate(
-          diff_x = c(NA, diff(get(posCols[1]))),
-          diff_y = c(NA, diff(get(posCols[2]))),
-          diff_z = c(NA, diff(get(posCols[3]))),
-          diff_time = c(NA, diff(time)),
-      )%>%
-      mutate(
-          distance = sqrt(diff_x^2 + diff_y^2 + diff_z^2),
-          velocity = distance / diff_time
-      )
+    # Calculate positional differences
+    diffs <- data.frame(lapply(data[, posCols], function(col) c(NA, diff(col))))
+    names(diffs) <- paste0("diff_", posCols)
+    diffs$diff_time <- c(NA, diff(data$time))
     
-    # Calculate quaternion rotational velocity
-    rotational_velocity <- rep(NA, nrow(tempData))
-    for (j in 2:nrow(tempData)) {
-        q1 <- tempData[j - 1, quatCols]
-        q2 <- tempData[j, quatCols]
-        angle_diff <- quatDiff(q1, q2)
-        rotational_velocity[j] <- angle_diff / tempData$diff_time[j]
-    }
+    # Calculate quaternion differences and rotational velocity
+    quat_current <- tempData[, quatCols]
+    quat_next <- rbind(quat_current[-1, ], rep(NA, length(quatCols)))
+    dot_product <- rowSums(quat_current * quat_next, na.rm = FALSE)
+    
+    # Clamping dot product within the range [-1, 1] to avoid NaNs
+    dot_product <- pmin(pmax(dot_product, -1), 1)
+    rotational_diff <- 2 * acos(dot_product)
+    rotational_velocity <- c(NA, rotational_diff[-1] / diffs$diff_time[-1])  # Skip first and align lengths
 
+    # Combine diffs with data and calculate linear velocity
+    tempData <- cbind(data, diffs)
+    tempData$distance <- sqrt(rowSums(tempData[, paste0("diff_", posCols)]^2))
+    tempData$velocity <- tempData$distance / tempData$diff_time
     tempData$rotational_velocity <- rotational_velocity
-    
+      
     # Identify velocity artifacts
     velocity_artifact_indices <- which(tempData$velocity > velocity_threshold)
     rotational_velocity_artifact_indices <- which(tempData$rotational_velocity > rotational_velocity_threshold)
     combined_artifact_indices <- unique(c(velocity_artifact_indices, rotational_velocity_artifact_indices))
     
     # Mark artifacts
-    data$artifact[velocity_artifact_indices] <- trackerName
-
+    data$artifact[combined_artifact_indices] <- trackerName
+    #print(rotational_velocity_artifact_indices)
     # Interpolate
-    tempData[velocity_artifact_indices, trackerCols] <- NA
+    tempData[combined_artifact_indices, trackerCols] <- NA
     tempData[, posCols] <- na.approx(tempData[, posCols])
-    #tempData <- interpolateQuaternions(tempData, quatCols, combined_artifact_indices)
+    tempData <- interpolateQuaternions(tempData, quatCols, combined_artifact_indices) 
   }
   
   data[, trackerCols] <- tempData[, trackerCols]
@@ -510,21 +516,21 @@ filterArtifacts <- function(data, trackerName, velocity_threshold = 10, rotation
   return(data)
 }
 
-#filterArtifacts(trackerData, "LeftFoot") # example usage
+#filterArtifacts(trackerData, "TreadmillLeft") # example usage
 
-filterAllData <- function(data, velocity_threshold = 10, rotational_velocity_threshold = 500, passes = 1) {
+filterAllData <- function(data, velocity_threshold = 10, rotational_velocity_threshold = 100, passes = 1) {
   # Process and filter each dataset with a unique artifact label  --> Note, if 2 datasets both have an artefact at the same time frame, only the last one here will be saved.
+  data <- filterArtifacts(data, "TreadmillLeft", velocity_threshold, rotational_velocity_threshold, passes)
   data <- filterArtifacts(data, "TreadmillRight", velocity_threshold, rotational_velocity_threshold, passes)
-  data <- filterArtifacts(data, "TreadmillLeft", rotational_velocity_threshold, velocity_threshold, passes)
   data <- filterArtifacts(data, "LeftFoot", velocity_threshold, rotational_velocity_threshold, passes)
-  #data <- filterArtifacts(data, "RightFoot", velocity_threshold, passes)
+  #data <- filterArtifacts(data, "RightFoot", velocity_threshold, rotational_velocity_threshold, passes)
   
   return(data)
 }
 
 # Usage example:
 filteredData <- filterAllData(trackerData, 10, 50, 1)
-filteredData[filteredData$artifact != "none",]
+#filteredData[filteredData$artifact != "none",]
 ```
 
 ### Select data to plot
@@ -557,16 +563,18 @@ inputPanel(
   selectizeInput("yplot", "Y-axis", 
                 choices = xOptions, selected = xOptions[2], multiple = FALSE),
   numericInput("maxv", "Max velocity (m/s)",
-              min = 0, max = 500, value = 10, step = 1),
+              min = 0, max = 50, value = 10, step = 1),
   numericInput("maxvRot", "Max rotational velocity (rad/s)",
               min = 0, max = 5000, value = 300, step = 15),
+  numericInput("nPasses", "Number of passes",
+              min = 1, max = 10, value = 1, step = 1),
   numericInput("plotheight", "Plot Height",
             min = 50, max = Inf, value = 500, step = 50),
 )
 
 renderPlot({
   data <- getTrackerDataForTrial(input$participant, input$TrialNumber)
-  data <- filterAllData(data, input$maxv, input$maxvRot, 1)
+  data <- filterAllData(data, input$maxv, input$maxvRot, input$nPasses)
   
   # Create plot
   return(plotData2D(data, input$xplot, input$yplot))
@@ -574,14 +582,13 @@ renderPlot({
 
 plotData2D <- function(data, x_axis, y_axis) {
   # Filter out the desired time to plot
-  data <- data[trackerData$time >= input$start & trackerData$time <= input$end, ]
+  data <- data[data$time >= input$start & data$time <= input$end, ]
   
   p <- ggplot(data, aes_string(x = x_axis, y = y_axis)) +
     geom_line(color = "black") +
     geom_point(aes_string(color = "artifact"), data = data[data$artifact != "none", ]) +
     scale_color_manual(values = c("LeftFoot" = "red", "RightFoot" = "blue", "TreadmillLeft" = "green", "TreadmillRight" = "purple")) +
     theme_minimal()
-    #labs(x = x_axis, y = y_axis) +
 
   return(p)
 }
@@ -594,7 +601,7 @@ We also need to transform the data to the Lokomat reference frame.
 First, we find the transformation matrix by using the two trackers next to the treadmill to identify the origin position and orientation.
 
 Here:
-- `x = right`
+- `x = left`
 - `y = up`
 - `z = front`
 
@@ -637,14 +644,6 @@ averageQuaternion <- function(quaternions) {
   return(avgQ)
 }
 
-quaternionToUpVector <- function(quaternion) {
-  # Convert quaternion to rotation matrix
-  rotMatrix <- quaternionToRotationMatrix(quaternion)
-  # Extract 'up' vector (second row of the rotation matrix)
-  upVector <- rotMatrix[2, 1:3]
-  return(upVector)
-}
-
 vectorCrossProduct <- function(a, b) {
   c(
     a[2]*b[3] - a[3]*b[2],
@@ -653,30 +652,34 @@ vectorCrossProduct <- function(a, b) {
   )
 }
 
-
 calculateTransformationMatrix <- function(trackerData) {
-  # Calculate the average position of the trackers over the first 100 frames
-  avgLeftPos <- colMeans(trackerData[1:100, c("TreadmillLeft.pos.x", "TreadmillLeft.pos.y", "TreadmillLeft.pos.z")])
-  avgRightPos <- colMeans(trackerData[1:100, c("TreadmillRight.pos.x", "TreadmillRight.pos.y", "TreadmillRight.pos.z")])
+  # Calculate the average position of the trackers over the first x frames
+  frames <- 1:length(trackerData[,1])
+  avgLeftPos <- colMeans(trackerData[frames, c("TreadmillLeft.pos.x", "TreadmillLeft.pos.y", "TreadmillLeft.pos.z")])
+  avgRightPos <- colMeans(trackerData[frames, c("TreadmillRight.pos.x", "TreadmillRight.pos.y", "TreadmillRight.pos.z")])
 
   # X Axis: Line between two trackers
   xAxis <- avgRightPos - avgLeftPos
   xAxis <- xAxis / sqrt(sum(xAxis^2))  # Normalize
-
+  
   # Y Axis: Average 'up' direction of the trackers
   # Assuming 'up' is represented by the y-component of the quaternion rotation
-  leftUp <- quaternionToUpVector(colMeans(trackerData[1:100, c("TreadmillLeft.rot.w", "TreadmillLeft.rot.x", "TreadmillLeft.rot.y", "TreadmillLeft.rot.z")]))
-  rightUp <- quaternionToUpVector(colMeans(trackerData[1:100, c("TreadmillRight.rot.w", "TreadmillRight.rot.x", "TreadmillRight.rot.y", "TreadmillRight.rot.z")]))
+  meanQuatLeft <- colMeans(trackerData[frames, c("TreadmillLeft.rot.w", "TreadmillLeft.rot.x", "TreadmillLeft.rot.y", "TreadmillLeft.rot.z")])
+  leftUp <- quaternionToRotationMatrix(meanQuatLeft)[2, 1:3] # z axis is up
+  meanQuatRight <- colMeans(trackerData[frames, c("TreadmillRight.rot.w", "TreadmillRight.rot.x", "TreadmillRight.rot.y", "TreadmillRight.rot.z")])
+  rightUp <- quaternionToRotationMatrix(meanQuatRight)[2, 1:3]
   yAxis <- (leftUp + rightUp) / 2
   yAxis <- yAxis / sqrt(sum(yAxis^2))  # Normalize
-
+  
+  #yAxis <- c(0,1,0)
   # Z Axis: Orthogonal to X and Y
-  zAxis <- vectorCrossProduct(xAxis, yAxis)
+  zAxis <- vectorCrossProduct(yAxis, xAxis)
   zAxis <- zAxis / sqrt(sum(zAxis^2))  # Normalize
 
   # Create the rotation matrix
-  rotationMatrix <- rbind(xAxis, yAxis, zAxis)
-  rotationMatrix <- rbind(c(1,0,0), c(0,1,0), c(0,0,1))
+  rotationMatrix <- rbind(xAxis, zAxis, yAxis) # we swap y and z, I think because LH vs RH coordinate frame
+  print(rotationMatrix)
+  #rotationMatrix <- rbind(c(1,0,0), c(0,1,0), c(0,0,1))
   
   # Ensure rotation matrix is 3x3
   rotationMatrix <- matrix(rotationMatrix, nrow = 3, ncol = 3)
@@ -737,33 +740,54 @@ transformedData <- transformAllData(filteredData, tmatrix)
 First thing to do is check if our transform works. We do this by making a 3D plot that shows our new reference frame. 
 
 ```{r,echo=FALSE}
-inputPanel(
-  numericInput("3dplotheight", "Plot Height",
-            min = 50, max = Inf, value = 500, step = 50)
-)
-cols3d <- grep("LeftFoot.pos", colnames(trackerData), value = TRUE)
+tfGizmo <- function(origin, len, rotationMatrix = diag(4)){
+  rotationMatrix <- rotationMatrix[1:3,1:3] # we only use the rotation
+  xAxis <- as.vector(rotationMatrix %*% c(len, 0, 0))
+  yAxis <- as.vector(rotationMatrix %*% c(0, len, 0))
+  zAxis <- as.vector(rotationMatrix %*% c(0, 0, len))
+  arrow3d(origin, origin + xAxis, col="red")   # X-axis
+  arrow3d(origin, origin + yAxis, col="green") # Y-axis
+  arrow3d(origin, origin + zAxis, col="blue")  # Z-axis
+}
+
+drawMeanAxes <- function(data, trackerName){
+  posCols <- grep(paste0(trackerName,".pos"), colnames(data), value = TRUE)
+  rotCols <- grep(paste0(trackerName,".rot"), colnames(data), value = TRUE)
+  
+  # Calculate the means
+  meanPos <- sapply(data[, posCols], mean, na.rm = TRUE)
+  meanQuaternion <- sapply(data[, rotCols], mean, na.rm = TRUE) # this should be done with slerp but for now this is fine.
+  
+  points3d(meanPos[1], meanPos[2], meanPos[3], col = "red", size = 5)
+  tfGizmo(meanPos, 0.1, quaternionToRotationMatrix(meanQuaternion))
+}
 
 renderRglwidget({
   # Clear existing rgl plot
   rgl::rgl.clear()
+  # Set uniform aspect ratio
+  rgl::aspect3d(1, 1, 1)
+  # Get data
   data <- getTrackerDataForTrial(input$participant, input$TrialNumber)
   data <- filterAllData(data, input$maxv, 1)
   tmatrix <- calculateTransformationMatrix(data)
   data <- transformAllData(data, tmatrix)
   
+  # Add origin arrows
+  tfGizmo(c(0,0,0), 0.2)
+  
   # Create your 3D plot
-  # Assuming transformedData is available globally
-  lines3d(data[[cols3d[1]]], data[[cols3d[2]]], data[[cols3d[3]]], color="black")
-  #specialPoints <- transformedData[transformedData$artifact, ]
-  #points3d(specialPoints$x, specialPoints$y, specialPoints$z, color="red", size=3)
+  leftFootCols <- grep("LeftFoot.pos", colnames(trackerData), value = TRUE)
+  lines3d(data[[leftFootCols[1]]], data[[leftFootCols[2]]], data[[leftFootCols[3]]], color="black") 
+  
+  drawMeanAxes(data, "TreadmillLeft")
+  drawMeanAxes(data, "TreadmillRight")
   
   # Return the rgl widget
   rglwidget()
 })
 
 ```
-
-
 
 # Plotting
 
