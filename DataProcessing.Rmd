@@ -58,6 +58,9 @@ library(zoo)
 
 # Interactive 3D plots
 library(rgl)
+
+# Cross product
+library(pracma)
 ```
 
 (Optional) clear the environment
@@ -623,7 +626,6 @@ Here:
 - `z = front`
 
 ```{r}
-library(pracma)
 quaternionToRotationMatrix <- function(q) {
     # Ensure the quaternion is normalized
     q <- q / sqrt(sum(q^2))
@@ -699,13 +701,13 @@ calculateTransformationMatrix <- function(trackerData) {
   zAxis <- zAxis / sqrt(sum(zAxis^2))  # Normalize
   
   # Create the rotation matrix
-  rotationMatrix <- cbind(xAxis, zAxis, yAxis)#(c(1,0,0),c(0,1,0), c(0,0,1))
+  rotationMatrix <- cbind(xAxis, zAxis, yAxis)# rbind(c(1,0,0),c(0,1,0), c(0,0,1))#
   
   # Ensure rotation matrix is 3x3
   rotationMatrix <- matrix(rotationMatrix, nrow = 3, ncol = 3)
   # Create the translation matrix
   translationMatrix <- diag(4)
-  translationMatrix[1:3, 4] <- colMeans(rbind(avgLeftPos, avgRightPos))
+  translationMatrix[1:3, 4] <- -colMeans(rbind(avgLeftPos, avgRightPos))
 
   # Combine the rotation and translation into a single transformation matrix
   transformationMatrix <- rbind(cbind(rotationMatrix, translationMatrix[1:3,4]), c(0, 0, 0, 1))
@@ -715,7 +717,7 @@ calculateTransformationMatrix <- function(trackerData) {
 
 # Example usage with your tracker data
 tmatrix <- calculateTransformationMatrix(filteredData)
-#tmatrix
+tmatrix
 ```
 
 ### Transformed the data
@@ -801,7 +803,7 @@ renderRglwidget({
   data <- getTrackerDataForTrial(input$participant, input$TrialNumber)
   data <- filterAllData(data, input$maxv, input$nPasses)
   tmatrix <- calculateTransformationMatrix(data)
-  #data <- transformAllData(data, tmatrix)
+  data <- transformAllData(data, tmatrix)
   
   # add axes
   axes3d()
@@ -810,10 +812,10 @@ renderRglwidget({
   # Add origin arrows
   tfGizmo(c(0,0,0), 0.2)
   
-  origin <- tmatrix[1:3, 4]
-  arrow3d(origin, origin + 0.3*tmatrix[1:3, 1], col="red")   # X-axis
-  arrow3d(origin, origin + 0.3*tmatrix[1:3, 2], col="green") # Y-axis
-  arrow3d(origin, origin + 0.3*tmatrix[1:3, 3], col="blue")  # Z-axis
+  #origin <- tmatrix[1:3, 4]
+  #arrow3d(origin, origin + 0.3*tmatrix[1:3, 1], col="red")   # X-axis
+  #arrow3d(origin, origin + 0.3*tmatrix[1:3, 2], col="green") # Y-axis
+  #arrow3d(origin, origin + 0.3*tmatrix[1:3, 3], col="blue")  # Z-axis
   # <- -colMeans(rbind(avgLeftPos, avgRightPos))
   
   
@@ -881,8 +883,10 @@ finalData <- detectStancePhase(transformedData, velocityMin, velocityMax, minSta
 
 ```{r}
 
-extractGaitMetrics <- function(data, trackerName) {
-  posCols <- grep(paste0(trackerName,".pos"), colnames(data), value = TRUE)
+extractGaitMetrics <- function(data, trackerNameLeft, trackerNameRight) {
+  posColsLeft <- grep(paste0(trackerNameLeft,".pos"), colnames(data), value = TRUE)
+  posColsRight <- grep(paste0(trackerNameRight,".pos"), colnames(data), value = TRUE)
+  posCols <- posColsLeft
   xCol <- grep("x", posCols, value = TRUE)
   yCol <- grep("y", posCols, value = TRUE)
   zCol <- grep("z", posCols, value = TRUE)
@@ -934,7 +938,7 @@ extractGaitMetrics <- function(data, trackerName) {
 }
 
 # Example usage
-#gaitMetrics <- extractGaitMetrics(finalData, "LeftFoot")
+#gaitMetrics <- extractGaitMetrics(finalData, "LeftFoot", "RightFoot")
 ```
 
 ### Final data function
@@ -951,7 +955,7 @@ getFinalResult <- function(participant, TrialNumber, maxVelocity = 10, nPasses =
   velocityMax <- 0      # e.g., 0.5 m/s
   minStanceDuration <- 0.1 # e.g., 100 ms
   data <- detectStancePhase(data, velocityMin, velocityMax, minStanceDuration)
-  gaitMetrics <- extractGaitMetrics(data, "LeftFoot")
+  gaitMetrics <- extractGaitMetrics(data, "LeftFoot", "RightFoot")
   
   return(list(data = data, gaitMetrics = gaitMetrics))
 }
@@ -1025,19 +1029,14 @@ inputPanel(
 renderPlot({
 
     # Create plot
-  return(plotData2D(data, input$xplot, input$yplot))
+  return(plotDataHist(data, input$xplot, input$yplot))
 }, height = reactive(input$plotheight))
 
 plotDataHist <- function(data, x_axis, y_axis) {
   # Filter out the desired time to plot
   data <- data[data$time >= input$start & data$time <= input$end, ]
   
-  p <- ggplot(data, aes_string(x = x_axis, y = y_axis)) +
-    geom_line(color = "black") +
-    geom_point(aes_string(color = "artifact"), data = data[data$artifact != "none", ]) +
-    scale_color_manual(values = c("LeftFoot" = "red", "RightFoot" = "blue", "TreadmillLeft" = "green", "TreadmillRight" = "purple")) +
-    theme_minimal()
-
+  p = hist(data[[input$histPlot]])
   return(p)
 }
 
