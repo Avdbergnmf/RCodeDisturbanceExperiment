@@ -298,30 +298,42 @@ We first find the start and end times for each trial and each participant
 
 ```{r}
 findTrialTimes <- function(participant, trialNumber) {
-  # Retrieve trial start and end times from loko_lokodata
-  lokoData <- getTdata(participant, "loko_lokodata", trialNumber)
-  
-  # Identifying the index where trialStarted turns to 1
-  startIndex <- which(lokoData$trialStarted == 1)[1]
-  
-  # Identifying the index where trialStarted turns back to 0
-  endIndex <- tail(which(lokoData$trialStarted == 1), 1) # this grabs the last time this happens, if there are multiple trials within the same datafile (which shouldn't happen), this is not accounted for
+    # Retrieve trial start and end times from loko_lokodata
+    lokoData <- getTdata(participant, "loko_lokodata", trialNumber)
+    
+    ##### TEMPORARILY PUT HERE FOR TESTING
+    # Find the first index in the vive dataset and match it (we're using a lokodata dataset from another test, because in this one it wasnt recorded due to a bug.)
+    startTime <- getTdata(participant, "vivetrackers", trialNumber)$time[1]
+    lokoData$time <- lokoData$time - (lokoData$time[1] - startTime)
+    
+    # Find indices where trialStarted transitions from 0 to 1 (start) and 1 to 0 (end)
+    transitions <- diff(lokoData$trialStarted)
+    startIndex <- which(transitions == 1)[1]  # First transition from 0 to 1
+    endIndex <- which(transitions == -1)[which(which(transitions == -1) > startIndex)[1]]  # First transition from 1 to 0 after the start
 
-  # Extracting time and Lokotime at the start and end of the trial
-  trialStartTime <- lokoData$time[startIndex]
-  trialStartLokotime <- lokoData$Lokotime[startIndex]
-  trialEndTime <- lokoData$time[endIndex]
-  trialEndLokotime <- lokoData$Lokotime[endIndex]
+    # Identifying the index where trialStarted turns back to 0
+    #endIndex <- tail(which(lokoData$trialStarted == 1), 1) # this grabs the last time this happens, if there are multiple trials within the same datafile (which shouldn't happen), this is not accounted for
+    
+    # Ensure that both start and end indices are found
+    if (is.na(startIndex) || is.na(endIndex)) {
+        stop("Could not find start or end of the trial.")
+    }
 
-  # Save the start and end times for later use or analysis
-  trialTimes <- data.frame(
-    Start_Time = trialStartTime, 
-    Start_Lokotime = trialStartLokotime,
-    End_Time = trialEndTime,
-    End_Lokotime = trialEndLokotime
-  )
-  
-  return(trialTimes)
+    # Extracting time and Lokotime at the start and end of the trial
+    trialStartTime <- lokoData$time[startIndex]
+    trialStartLokotime <- lokoData$Lokotime[startIndex]
+    trialEndTime <- lokoData$time[endIndex]
+    trialEndLokotime <- lokoData$Lokotime[endIndex]
+
+    # Save the start and end times for later use or analysis
+    trialTimes <- data.frame(
+        Start_Time = trialStartTime, 
+        Start_Lokotime = trialStartLokotime,
+        End_Time = trialEndTime,
+        End_Lokotime = trialEndLokotime
+    )
+    
+    return(trialTimes)
 }
 
 # Example usage
@@ -462,9 +474,9 @@ filterArtifacts <- function(data, trackerName, velocity_threshold = 10, rotation
   artifact_indices <- c()
   
   # Check if any component is exactly zero, mark as artifact
-  THRESHOLD = 0.00001
+  THRESHOLD = 0.00001 # To account for floating point inaccuracies
   for (col in trackerCols) {
-    artifact_indices <- c(artifact_indices, which(abs(tempData[[col]]) == 0))
+    artifact_indices <- c(artifact_indices, which(abs(tempData[[col]]) <= THRESHOLD))
   }
   artifact_indices <- sort(unique(artifact_indices))
   
@@ -523,7 +535,7 @@ filterAllData <- function(data, velocity_threshold = 10, rotational_velocity_thr
   data <- filterArtifacts(data, "TreadmillLeft", velocity_threshold, rotational_velocity_threshold, passes)
   data <- filterArtifacts(data, "TreadmillRight", velocity_threshold, rotational_velocity_threshold, passes)
   data <- filterArtifacts(data, "LeftFoot", velocity_threshold, rotational_velocity_threshold, passes)
-  #data <- filterArtifacts(data, "RightFoot", velocity_threshold, rotational_velocity_threshold, passes)
+  data <- filterArtifacts(data, "RightFoot", velocity_threshold, rotational_velocity_threshold, passes)
   
   return(data)
 }
@@ -553,8 +565,9 @@ inputPanel(
 We plot our data in 2D to check our filtered datapoints to make sure we are not discarding important data. Play with the max velocity by which the data is filtered.
 
 ```{r,echo=FALSE}
-posCols <- grep(".pos", colnames(trackerData), value = TRUE)
-rotCols <- grep(".rot", colnames(trackerData), value = TRUE)
+data <- getTrackerDataForTrial(participants[1], 1)
+posCols <- grep(".pos", colnames(data), value = TRUE)
+rotCols <- grep(".rot", colnames(data), value = TRUE)
 xOptions = c("time", posCols, rotCols)
 
 inputPanel(
@@ -570,11 +583,15 @@ inputPanel(
               min = 1, max = 10, value = 1, step = 1),
   numericInput("plotheight", "Plot Height",
             min = 50, max = Inf, value = 500, step = 50),
+  checkboxInput("filter", "Filter",
+            value = TRUE)
 )
 
 renderPlot({
   data <- getTrackerDataForTrial(input$participant, input$TrialNumber)
-  data <- filterAllData(data, input$maxv, input$maxvRot, input$nPasses)
+  if (input$filter) {
+    data <- filterAllData(data, input$maxv, input$maxvRot, input$nPasses)
+  }
   
   # Create plot
   return(plotData2D(data, input$xplot, input$yplot))
@@ -606,6 +623,7 @@ Here:
 - `z = front`
 
 ```{r}
+library(pracma)
 quaternionToRotationMatrix <- function(q) {
     # Ensure the quaternion is normalized
     q <- q / sqrt(sum(q^2))
@@ -644,12 +662,13 @@ averageQuaternion <- function(quaternions) {
   return(avgQ)
 }
 
-vectorCrossProduct <- function(a, b) {
-  c(
-    a[2]*b[3] - a[3]*b[2],
-    a[3]*b[1] - a[1]*b[3],
-    a[1]*b[2] - a[2]*b[1]
-  )
+findOrthogonalVector <- function(vectorA, vectorB) {
+    # Check if vectors are of length 3
+    if (length(vectorA) != 3 || length(vectorB) != 3) {
+        stop("Both vectors must be of length 3.")
+    }
+  
+    return(cross(vectorA, vectorB))
 }
 
 calculateTransformationMatrix <- function(trackerData) {
@@ -665,27 +684,28 @@ calculateTransformationMatrix <- function(trackerData) {
   # Y Axis: Average 'up' direction of the trackers
   # Assuming 'up' is represented by the y-component of the quaternion rotation
   meanQuatLeft <- colMeans(trackerData[frames, c("TreadmillLeft.rot.w", "TreadmillLeft.rot.x", "TreadmillLeft.rot.y", "TreadmillLeft.rot.z")])
-  leftUp <- quaternionToRotationMatrix(meanQuatLeft)[2, 1:3] # z axis is up
+  leftUp <- quaternionToRotationMatrix(meanQuatLeft)[2, 1:3] # y axis is up
   meanQuatRight <- colMeans(trackerData[frames, c("TreadmillRight.rot.w", "TreadmillRight.rot.x", "TreadmillRight.rot.y", "TreadmillRight.rot.z")])
   rightUp <- quaternionToRotationMatrix(meanQuatRight)[2, 1:3]
   yAxis <- (leftUp + rightUp) / 2
   yAxis <- yAxis / sqrt(sum(yAxis^2))  # Normalize
   
-  #yAxis <- c(0,1,0)
+  projection <- sum(yAxis * xAxis) * xAxis # Project xAxis onto yAxis
+  yAxisOrthogonal <- yAxis - projection # Subtract the projection from xAxis to get the orthogonal component
+  yAxisOrthogonal <- yAxisOrthogonal / sqrt(sum(yAxisOrthogonal^2)) # Normalize the new X axis
+  yAxis <- yAxisOrthogonal
   # Z Axis: Orthogonal to X and Y
-  zAxis <- vectorCrossProduct(yAxis, xAxis)
+  zAxis <- findOrthogonalVector(xAxis, yAxis)
   zAxis <- zAxis / sqrt(sum(zAxis^2))  # Normalize
-
+  
   # Create the rotation matrix
-  rotationMatrix <- rbind(xAxis, zAxis, yAxis) # we swap y and z, I think because LH vs RH coordinate frame
-  print(rotationMatrix)
-  #rotationMatrix <- rbind(c(1,0,0), c(0,1,0), c(0,0,1))
+  rotationMatrix <- cbind(xAxis, zAxis, yAxis)#(c(1,0,0),c(0,1,0), c(0,0,1))
   
   # Ensure rotation matrix is 3x3
   rotationMatrix <- matrix(rotationMatrix, nrow = 3, ncol = 3)
   # Create the translation matrix
   translationMatrix <- diag(4)
-  translationMatrix[1:3, 4] <- -colMeans(rbind(avgLeftPos, avgRightPos))
+  translationMatrix[1:3, 4] <- colMeans(rbind(avgLeftPos, avgRightPos))
 
   # Combine the rotation and translation into a single transformation matrix
   transformationMatrix <- rbind(cbind(rotationMatrix, translationMatrix[1:3,4]), c(0, 0, 0, 1))
@@ -740,7 +760,7 @@ transformedData <- transformAllData(filteredData, tmatrix)
 First thing to do is check if our transform works. We do this by making a 3D plot that shows our new reference frame. 
 
 ```{r,echo=FALSE}
-tfGizmo <- function(origin, len, rotationMatrix = diag(4)){
+tfGizmo <- function(origin, len, rotationMatrix = diag(4), label = "", labelaxes = TRUE){
   rotationMatrix <- rotationMatrix[1:3,1:3] # we only use the rotation
   xAxis <- as.vector(rotationMatrix %*% c(len, 0, 0))
   yAxis <- as.vector(rotationMatrix %*% c(0, len, 0))
@@ -748,6 +768,16 @@ tfGizmo <- function(origin, len, rotationMatrix = diag(4)){
   arrow3d(origin, origin + xAxis, col="red")   # X-axis
   arrow3d(origin, origin + yAxis, col="green") # Y-axis
   arrow3d(origin, origin + zAxis, col="blue")  # Z-axis
+  
+  textSize <- 0.6
+  text3d(origin, text = label, col = "white", adj = c(0, 0), cex = textSize)
+  
+  # Label the axes
+  if (labelaxes) {
+    text3d(origin + xAxis, text = "X", col = "red", adj = c(0, 0), cex = 0.5*textSize)
+    text3d(origin + yAxis, text = "Y", col = "green", adj = c(0, 0), cex = 0.5*textSize)
+    text3d(origin + zAxis, text = "Z", col = "blue", adj = c(0, 0), cex = 0.5*textSize)
+  }
 }
 
 drawMeanAxes <- function(data, trackerName){
@@ -759,7 +789,7 @@ drawMeanAxes <- function(data, trackerName){
   meanQuaternion <- sapply(data[, rotCols], mean, na.rm = TRUE) # this should be done with slerp but for now this is fine.
   
   points3d(meanPos[1], meanPos[2], meanPos[3], col = "red", size = 5)
-  tfGizmo(meanPos, 0.1, quaternionToRotationMatrix(meanQuaternion))
+  tfGizmo(meanPos, 0.1, quaternionToRotationMatrix(meanQuaternion), trackerName)
 }
 
 renderRglwidget({
@@ -769,16 +799,29 @@ renderRglwidget({
   rgl::aspect3d(1, 1, 1)
   # Get data
   data <- getTrackerDataForTrial(input$participant, input$TrialNumber)
-  data <- filterAllData(data, input$maxv, 1)
+  data <- filterAllData(data, input$maxv, input$nPasses)
   tmatrix <- calculateTransformationMatrix(data)
-  data <- transformAllData(data, tmatrix)
+  #data <- transformAllData(data, tmatrix)
+  
+  # add axes
+  axes3d()
+  axis3d('y', pos = c(0, 0, 0))
   
   # Add origin arrows
   tfGizmo(c(0,0,0), 0.2)
   
+  origin <- tmatrix[1:3, 4]
+  arrow3d(origin, origin + 0.3*tmatrix[1:3, 1], col="red")   # X-axis
+  arrow3d(origin, origin + 0.3*tmatrix[1:3, 2], col="green") # Y-axis
+  arrow3d(origin, origin + 0.3*tmatrix[1:3, 3], col="blue")  # Z-axis
+  # <- -colMeans(rbind(avgLeftPos, avgRightPos))
+  
+  
   # Create your 3D plot
   leftFootCols <- grep("LeftFoot.pos", colnames(trackerData), value = TRUE)
   lines3d(data[[leftFootCols[1]]], data[[leftFootCols[2]]], data[[leftFootCols[3]]], color="black") 
+  rightFootCols <- grep("RightFoot.pos", colnames(trackerData), value = TRUE)
+  lines3d(data[[rightFootCols[1]]], data[[rightFootCols[2]]], data[[rightFootCols[3]]], color="black") 
   
   drawMeanAxes(data, "TreadmillLeft")
   drawMeanAxes(data, "TreadmillRight")
@@ -786,6 +829,217 @@ renderRglwidget({
   # Return the rgl widget
   rglwidget()
 })
+
+```
+
+# Extracting gait data
+
+Now our data is loaded, cleaned, and transformed, the gait phases can be extracted.
+
+## Detect gait phases
+
+```{r}
+detectStancePhase <- function(data, velocityMin, velocityMax, minStanceDuration) {
+  
+  # Smooth the data (optional)
+  data$LeftFoot.pos.y <- stats::filter(data$LeftFoot.pos.y, rep(1/10, 10), sides = 2)
+  data$LeftFoot.pos.z <- stats::filter(data$LeftFoot.pos.z, rep(1/10, 10), sides = 2)
+  # Calculate horizontal velocity
+  data$LeftFoot.vel.z <- c(NA, diff(data$LeftFoot.pos.z) / diff(data$time))
+  # Smooth the data (optional)
+  data$LeftFoot.vel.z <- stats::filter(data$LeftFoot.vel.z, rep(1/10, 10), sides = 2)
+
+  # Calculate ground level
+  validHeights <- data$LeftFoot.pos.y[!is.na(data$LeftFoot.pos.y)]
+  sortedHeights <- sort(validHeights)
+  groundLevel <- mean(sortedHeights[1:floor(length(sortedHeights) * 0.3)])
+
+  
+  # Initialize stance phase detection
+  data$stancePhase <- FALSE
+  
+  # Detect stance phases
+  isStance <- data$LeftFoot.pos.y <= groundLevel + 0.03 & 
+              data$LeftFoot.vel.z >= velocityMin & 
+              data$LeftFoot.vel.z <= velocityMax
+  data$stancePhase <- ifelse(is.na(isStance), FALSE, isStance)
+
+  # Ensure minimum duration of stance phase
+  # ...
+
+  return(data)
+}
+
+# Example usage
+velocityMin <- -3     # e.g., -0.5 m/s
+velocityMax <- 0      # e.g., 0.5 m/s
+minStanceDuration <- 0.1 # e.g., 100 ms
+finalData <- detectStancePhase(transformedData, velocityMin, velocityMax, minStanceDuration)
+```
+
+## Extract Gait Metrics
+
+```{r}
+
+extractGaitMetrics <- function(data, trackerName) {
+  posCols <- grep(paste0(trackerName,".pos"), colnames(data), value = TRUE)
+  xCol <- grep("x", posCols, value = TRUE)
+  yCol <- grep("y", posCols, value = TRUE)
+  zCol <- grep("z", posCols, value = TRUE)
+
+  # Identifying heel strikes and toe-offs
+  toeOffs <- which(diff(data$stancePhase) == -1)
+  heelStrikes <- which(diff(data$stancePhase) == 1)
+  
+  # Check which event comes first in the dataset
+  if (length(heelStrikes) > 0 && length(toeOffs) > 0) {
+      if (heelStrikes[1] < toeOffs[1]) {
+          heelStrikes <- heelStrikes[-1] # If the first heel strike occurs before the first toe-off, discard the first heel strike
+      }
+
+      # Pair each heel strike with the subsequent toe-off
+      minEvents <- min(length(heelStrikes), length(toeOffs))
+      heelStrikes <- heelStrikes[1:minEvents]
+      toeOffs <- toeOffs[1:minEvents]
+  }
+  nextHeelStrikes <- c(heelStrikes[-1], NA) # Shift indices by one, pad with NA
+  
+  # Create a dataframe to store gait metrics
+  gaitMetrics <- data.frame(
+      ToeOffTime = data$time[toeOffs],
+      HeelStrikeTime = data$time[heelStrikes],
+      StepHeight = numeric(minEvents),
+      StepDuration = numeric(minEvents),
+      StepLength = numeric(minEvents),
+      HeelStrikeX = data[[xCol]][heelStrikes],
+      HeelStrikeY = data[[yCol]][heelStrikes],
+      HeelStrikeZ = data[[zCol]][heelStrikes],
+      ToeOffX = data[[xCol]][toeOffs],
+      ToeOffY = data[[yCol]][toeOffs],
+      ToeOffZ = data[[zCol]][toeOffs]
+  )
+  
+  gaitMetrics$StepDuration <- data$time[nextHeelStrikes] - gaitMetrics$HeelStrikeTime  # Calculate StepDuration
+  gaitMetrics$StepLength <- sqrt(  # Calculate StepLength
+      (data[[xCol]][nextHeelStrikes] - gaitMetrics$HeelStrikeX)^2 +
+      #(data[[yCol]][nextHeelStrikes] - gaitMetrics$HeelStrikeY)^2 +
+      (data[[zCol]][nextHeelStrikes] - gaitMetrics$HeelStrikeZ)^2
+  )
+  
+  # Handle the last step which might not have a next heel strike
+  gaitMetrics$StepDuration[length(heelStrikes)] <- NA
+  gaitMetrics$StepLength[length(heelStrikes)] <- NA
+
+  return(gaitMetrics)
+}
+
+# Example usage
+#gaitMetrics <- extractGaitMetrics(finalData, "LeftFoot")
+```
+
+### Final data function
+It'll be useful down the line to have one single function that will just return the final, cleaned and transformed data set for a participant. Let's define this function here:
+
+```{r}
+getFinalResult <- function(participant, TrialNumber, maxVelocity = 10, nPasses = 1){
+  data <- getTrackerDataForTrial(participant, TrialNumber)
+  data <- filterAllData(data, maxVelocity, nPasses)
+  tmatrix <- calculateTransformationMatrix(data)
+  data <- transformAllData(data, tmatrix)
+  
+  velocityMin <- -3     # e.g., -0.5 m/s
+  velocityMax <- 0      # e.g., 0.5 m/s
+  minStanceDuration <- 0.1 # e.g., 100 ms
+  data <- detectStancePhase(data, velocityMin, velocityMax, minStanceDuration)
+  gaitMetrics <- extractGaitMetrics(data, "LeftFoot")
+  
+  return(list(data = data, gaitMetrics = gaitMetrics))
+}
+
+# Example usage
+result <- getFinalResult(participants[1], 1)
+#finalData <- result$data
+#finalGaitMetrics <- result$gaitMetrics
+```
+
+### Plotting gait events
+To check our algorithm, its best we somehow visualize it and inspect it.
+
+```{r, echo=FALSE}
+
+plotGaitData <- function(result, trackerName) {
+  # Assign data variables
+  data <- result$data
+  gaitMetrics <- result$gaitMetrics
+  posCols <- grep(paste0(trackerName,".pos"), colnames(data), value = TRUE)
+  xCol <- grep("x", posCols, value = TRUE)
+  yCol <- grep("y", posCols, value = TRUE)
+  zCol <- grep("z", posCols, value = TRUE)
+  # Clear existing rgl plot
+  rgl::rgl.clear()
+  rgl::aspect3d(1, 1, 1) # Set uniform aspect ratio
+
+  # Add axes
+  axes3d()
+  axis3d('y', pos = c(0, 0, 0))
+
+  # Add origin arrows
+  tfGizmo(c(0,0,0), 0.2)
+  
+  # Plot foot trajectory
+  lines3d(data[[xCol]], data[[yCol]], data[[zCol]], color="black")
+
+  # Plot heel strikes and toe-offs from gaitMetrics
+  points3d(gaitMetrics$HeelStrikeX, gaitMetrics$HeelStrikeY, gaitMetrics$HeelStrikeZ, color="blue", size=5)
+  points3d(gaitMetrics$ToeOffX, gaitMetrics$ToeOffY, gaitMetrics$ToeOffZ, color="green", size=5)
+
+  # Add text annotations or markers for step height, duration, and length
+  #for (i in 1:nrow(gaitMetrics)) {text3d(x = gaitMetrics$HeelStrikeX[i], y = gaitMetrics$HeelStrikeY[i], z = gaitMetrics$HeelStrikeZ[i], text = paste("Duration:", round(gaitMetrics$StepDuration[i], 2), "s"),adj = c(0.5, 2))}
+
+  # Return the rgl widget
+  rglwidget()
+}
+
+renderRglwidget({
+  result <- getFinalResult(input$participant, input$TrialNumber, input$maxv, input$nPasses)
+  footTrackerName <- "LeftFoot"
+  plotGaitData(result, footTrackerName)
+})
+
+```
+
+### Histograms
+
+We would also like to see how our data is distributed to identify any outliers etc. Let's start by creating some histograms.
+
+```{r}
+histOptions = colnames(result$gaitMetrics)
+
+inputPanel(
+  selectizeInput("histPlot", "Metric", 
+                choices = histOptions, selected = histOptions[1], multiple = FALSE),
+  numericInput("plotheight", "Plot Height",
+            min = 50, max = Inf, value = 500, step = 50),
+)
+
+renderPlot({
+
+    # Create plot
+  return(plotData2D(data, input$xplot, input$yplot))
+}, height = reactive(input$plotheight))
+
+plotDataHist <- function(data, x_axis, y_axis) {
+  # Filter out the desired time to plot
+  data <- data[data$time >= input$start & data$time <= input$end, ]
+  
+  p <- ggplot(data, aes_string(x = x_axis, y = y_axis)) +
+    geom_line(color = "black") +
+    geom_point(aes_string(color = "artifact"), data = data[data$artifact != "none", ]) +
+    scale_color_manual(values = c("LeftFoot" = "red", "RightFoot" = "blue", "TreadmillLeft" = "green", "TreadmillRight" = "purple")) +
+    theme_minimal()
+
+  return(p)
+}
 
 ```
 
@@ -797,10 +1051,4 @@ inputPanel(
   actionButton("save", "Save figures")
 )
 ```
-
-
-
-
-## Plot trajectories
-
 
